@@ -1,0 +1,29 @@
+# ============================================================================
+#  ComprasGOV - ignora artefatos de build e arquivos locais/sensiveis
+# ============================================================================
+
+# --- Build -----------------------------------------------------------------
+bin/
+obj/
+out/
+publish/
+
+# --- Visual Studio / IDE ---------------------------------------------------
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# --- Configuracao local (NUNCA publicar) -----------------------------------
+# Guarda caminhos internos de rede (planilha e pasta de saida) e as notas
+# de especificacao originais, que contem informacoes do ambiente interno.
+**/Properties/launchSettings.json
+HTML.md
+HTML.txt
+
+# --- Diversos --------------------------------------------------------------
+*.log
+*.tmp
+.vscode/
+.idea/
