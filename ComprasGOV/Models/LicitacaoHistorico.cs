@@ -38,6 +38,17 @@ public sealed class LicitacaoHistorico
     public string Motivo { get; set; } = "";
     public string UrlCompras { get; set; } = "";
     public string UrlPncp { get; set; } = "";
+
+    /// <summary>Caminho(s) do(s) arquivo(s) baixado(s), um por linha.</summary>
     public string Arquivo { get; set; } = "";
+
+    /// <summary>
+    /// Estado do e-mail desta licitação:
+    /// null = registro antigo (não gerenciado por e-mail, nunca será enviado);
+    /// false = baixado e PENDENTE de envio (será enviado/reenviado numa próxima execução);
+    /// true = e-mail enviado com sucesso.
+    /// </summary>
+    public bool? EmailEnviado { get; set; }
+
     public DateTime DataProcessamento { get; set; } = DateTime.Now;
 }

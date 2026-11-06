@@ -263,6 +263,14 @@ public sealed class ComprasNetAutomacao
         }
     }
 
+    /// <summary>
+    /// true quando o portal respondeu à pesquisa (com cards ou com a mensagem de
+    /// "nenhum resultado"); false quando a pesquisa não concluiu (ex.: hCaptcha).
+    /// </summary>
+    public async Task<bool> PesquisaConcluidaAsync(IPage page) =>
+        await page.Locator(Seletores.CardLicitacao).CountAsync() > 0 ||
+        await page.Locator(Seletores.MensagemSemResultado).CountAsync() > 0;
+
     public async Task<bool> TemResultadosAsync(IPage page) =>
         await page.Locator(Seletores.CardLicitacao).CountAsync() > 0;
 

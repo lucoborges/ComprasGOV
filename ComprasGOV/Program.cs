@@ -6,8 +6,10 @@ using ComprasGOV.Services;
 using Microsoft.Playwright;
 
 // ---------------------------------------------------------------------------
-//  ComprasGOV - pesquisa no Compras.gov.br por UASG, valida o objeto,
-//  acompanha a compra, abre o PNCP e baixa o edital para a pasta de rede.
+//  ComprasGOV - busca as licitações com proposta em aberto por UASG (API
+//  oficial do PNCP, padrão; ou o portal Compras.gov.br pelo navegador), valida
+//  o objeto, baixa TODOS os arquivos do PNCP para a pasta de rede e envia por
+//  e-mail (2 a 4 licitações por mensagem). Roda 24/7 em ciclos.
 // ---------------------------------------------------------------------------
 
 Configuracao cfg = Configuracao.Ler(args);
@@ -35,53 +37,169 @@ if (cfg.InstalarNavegadores)
     }
 }
 
-// --- 1) Clientes (UASG) -----------------------------------------------------
-IReadOnlyList<ClienteUasg> clientes;
-
-if (!string.IsNullOrWhiteSpace(cfg.UasgManual))
+// Ctrl+C encerra com segurança: durante a pausa sai na hora; durante um ciclo,
+// termina a licitação atual e não inicia o próximo ciclo.
+using var cancelamento = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
 {
-    clientes = new List<ClienteUasg>
+    e.Cancel = true;
+    if (!cancelamento.IsCancellationRequested)
     {
-        new(cfg.UasgManual, "UASG informada na linha de comando")
-    };
-}
-else
+        Log.Aviso("Ctrl+C recebido: encerrando após a etapa atual...");
+        cancelamento.Cancel();
+    }
+};
+
+// Histórico local (não reprocessa o que já foi avaliado) - compartilhado entre ciclos.
+var historico = new HistoricoService(cfg.ArquivoHistorico);
+
+// API oficial do PNCP (sem navegador/captcha) - usada pela fonte "api" e pela comparação.
+var api = new PncpApiService(cfg.ArquivoCacheCnpj);
+
+bool usaNavegador = cfg.UsarPortal || cfg.Comparar || !string.IsNullOrWhiteSpace(cfg.TestarPncpUrl);
+Log.Info(cfg.Comparar ? "Modo: COMPARAÇÃO portal x API (não baixa, não envia e-mail)."
+       : usaNavegador ? "Fonte: portal Compras.gov.br (navegador; sujeito ao hCaptcha)."
+       : "Fonte: API oficial do PNCP (sem navegador e sem captcha).");
+
+// --testar-pncp e --comparar são sempre execução única.
+bool continuo = cfg.Continuo && !cfg.Comparar && string.IsNullOrWhiteSpace(cfg.TestarPncpUrl);
+if (continuo)
+    Log.Info($"Modo contínuo (24/7): pausa de {cfg.IntervaloMinutos} min entre ciclos. " +
+             "Use --uma-vez para um único ciclo; Ctrl+C para encerrar.");
+
+int exitCode = 0;
+int ciclo = 0;
+
+while (true)
 {
+    ciclo++;
+    DateTime inicioCiclo = DateTime.Now;
+    if (continuo) Log.Secao($"CICLO {ciclo} - início {inicioCiclo:dd/MM/yyyy HH:mm}");
+
+    exitCode = await ExecutarCicloAsync();
+
+    // --- Resumo do ciclo ---------------------------------------------------
+    Log.Secao(continuo ? $"RESUMO DO CICLO {ciclo}" : "RESUMO DA EXECUÇÃO");
+    historico.ExibirEstatisticas();
+    Log.Info(exitCode == 0 ? "Ciclo concluído sem falhas." : "Ciclo concluído com falhas (veja os erros acima).");
+
+    if (!continuo || cancelamento.IsCancellationRequested) break;
+
+    DateTime proximo = DateTime.Now.AddMinutes(cfg.IntervaloMinutos);
+    Log.Info($"Inativo por {cfg.IntervaloMinutos} min; próximo ciclo às {proximo:dd/MM/yyyy HH:mm}.");
     try
     {
-        IReadOnlyList<ClienteUasg> todos = new PlanilhaService().LerClientes(cfg.PastaPlanilha);
+        await Task.Delay(TimeSpan.FromMinutes(cfg.IntervaloMinutos), cancelamento.Token);
+    }
+    catch (OperationCanceledException)
+    {
+        break;
+    }
+}
 
-        // Por padrão processa apenas o primeiro cliente; --todos processa a lista inteira.
-        clientes = (!cfg.ProcessarTodosClientes && todos.Count > 0)
-            ? new List<ClienteUasg> { todos[0] }
-            : todos;
+Log.Info("ComprasGOV encerrado.");
+return exitCode;
 
-        Log.Info($"Planilha: {cfg.PastaPlanilha} ({todos.Count} UASG(s) válidos).");
+// ---------------------------------------------------------------------------
+//  Um ciclo completo: lê os clientes, processa (pela API ou pelo navegador),
+//  envia os e-mails. No modo portal abre/fecha o navegador a cada ciclo (evita
+//  acúmulo de memória e recupera quedas do Chromium). Nunca lança exceção.
+// ---------------------------------------------------------------------------
+async Task<int> ExecutarCicloAsync()
+{
+    IReadOnlyList<ClienteUasg>? clientes = CarregarClientes();
+    if (clientes is null) return 1;
+
+    if (!usaNavegador)
+    {
+        try
+        {
+            return await new ExecutadorFluxo(cfg, historico).ExecutarViaApiAsync(api, clientes, cancelamento.Token);
+        }
+        catch (Exception ex)
+        {
+            Log.Erro($"Falha na execução: {ex.Message}");
+            return 1;
+        }
+    }
+
+    try
+    {
+        using IPlaywright pw = await Playwright.CreateAsync();
+        IBrowserContext context = await CriarContextoAsync(pw);
+
+        try
+        {
+            if (cfg.Comparar)
+                return await new ComparadorFontes(cfg, historico, api).ExecutarAsync(context, clientes, cancelamento.Token);
+
+            return !string.IsNullOrWhiteSpace(cfg.TestarPncpUrl)
+                ? await TestarPncpAsync(context, cfg)
+                : await new ExecutadorFluxo(cfg, historico).ExecutarAsync(context, clientes, cancelamento.Token);
+        }
+        finally
+        {
+            try { await context.CloseAsync(); } catch { /* navegador já caiu */ }
+        }
+    }
+    catch (PlaywrightException ex)
+    {
+        Log.Erro($"Falha do navegador/Playwright: {ex.Message}");
+        return 1;
     }
     catch (Exception ex)
     {
-        Log.Erro($"Falha ao ler a planilha de clientes: {ex.Message}");
-        Log.Info("Dica: use --uasg <codigo> para informar a UASG manualmente.");
+        Log.Erro($"Falha na execução: {ex.Message}");
         return 1;
     }
 }
 
-if (clientes.Count == 0)
+// Clientes (UASG): --uasg ou a planilha (relida a cada ciclo para pegar alterações).
+IReadOnlyList<ClienteUasg>? CarregarClientes()
 {
-    Log.Erro("Nenhum cliente/UASG para processar.");
-    return 1;
+    IReadOnlyList<ClienteUasg> clientes;
+
+    if (!string.IsNullOrWhiteSpace(cfg.UasgManual))
+    {
+        clientes = new List<ClienteUasg>
+        {
+            new(cfg.UasgManual, "UASG informada na linha de comando")
+        };
+    }
+    else
+    {
+        try
+        {
+            IReadOnlyList<ClienteUasg> todos = new PlanilhaService().LerClientes(cfg.PastaPlanilha);
+
+            // Por padrão processa TODOS os clientes da planilha (--uasg limita a um só).
+            clientes = (!cfg.ProcessarTodosClientes && todos.Count > 0)
+                ? new List<ClienteUasg> { todos[0] }
+                : todos;
+
+            Log.Info($"Planilha: {cfg.PastaPlanilha} ({todos.Count} UASG(s) válidos).");
+        }
+        catch (Exception ex)
+        {
+            Log.Erro($"Falha ao ler a planilha de clientes: {ex.Message}");
+            Log.Info("Dica: use --uasg <codigo> para informar a UASG manualmente.");
+            return null;
+        }
+    }
+
+    if (clientes.Count == 0)
+    {
+        Log.Erro("Nenhum cliente/UASG para processar.");
+        return null;
+    }
+
+    Log.Info($"Clientes a processar: {clientes.Count}" +
+             (cfg.MaxLicitacoes.HasValue ? $" (até {cfg.MaxLicitacoes} licitação(ões) por ciclo)" : ""));
+    foreach (ClienteUasg c in clientes)
+        Log.Info($"   {c}");
+
+    return clientes;
 }
-
-Log.Info($"Clientes a processar: {clientes.Count}" +
-         (cfg.MaxLicitacoes.HasValue ? $" (até {cfg.MaxLicitacoes} licitação(ões) por execução)" : ""));
-foreach (ClienteUasg c in clientes)
-    Log.Info($"   {c}");
-
-// --- 2) Histórico local (não reprocessa o que já foi avaliado) --------------
-var historico = new HistoricoService(cfg.ArquivoHistorico);
-
-// --- 3) Navegador + fluxo ---------------------------------------------------
-int exitCode = 0;
 
 // Cria o contexto com o perfil persistente e as medidas anti-detecção do hCaptcha.
 async Task<IBrowserContext> CriarContextoAsync(IPlaywright pw)
@@ -116,33 +234,6 @@ async Task<IBrowserContext> CriarContextoAsync(IPlaywright pw)
     return context;
 }
 
-try
-{
-    using IPlaywright pw = await Playwright.CreateAsync();
-    IBrowserContext context = await CriarContextoAsync(pw);
-
-    try
-    {
-        exitCode = !string.IsNullOrWhiteSpace(cfg.TestarPncpUrl)
-            ? await TestarPncpAsync(context, cfg)
-            : await new ExecutadorFluxo(cfg, historico).ExecutarAsync(context, clientes);
-    }
-    finally
-    {
-        await context.CloseAsync();
-    }
-}
-catch (PlaywrightException ex)
-{
-    Log.Erro($"Falha do navegador/Playwright: {ex.Message}");
-    exitCode = 1;
-}
-catch (Exception ex)
-{
-    Log.Erro($"Falha na execução: {ex.Message}");
-    exitCode = 1;
-}
-
 // Abre uma URL do PNCP direto, localiza o edital e baixa (teste isolado do passo 3).
 async Task<int> TestarPncpAsync(IBrowserContext context, Configuracao cfgLocal)
 {
@@ -160,17 +251,20 @@ async Task<int> TestarPncpAsync(IBrowserContext context, Configuracao cfgLocal)
         await Task.Delay(2000);
 
         var pncp = new PncpAutomacao();
-        ArquivoEdital? edital = await pncp.LocalizarEditalAsync(page);
+        List<ArquivoPncp> arquivos = await pncp.ListarArquivosAsync(page);
 
-        if (edital is null)
+        if (arquivos.Count == 0)
         {
-            Log.Erro("Teste PNCP: nenhum arquivo 'Edital' localizado.");
+            Log.Erro("Teste PNCP: nenhum arquivo na aba 'Arquivos'.");
             return 1;
         }
 
         var download = new DownloadEditalService(cfgLocal.PastaSaida);
-        string caminho = await download.BaixarAsync(edital.Url, "TESTE", edital.Nome);
-        Log.Ok($"Teste PNCP concluído: {caminho}");
+        foreach (ArquivoPncp arquivo in arquivos)
+        {
+            string caminho = await download.BaixarAsync(arquivo.Url, "TESTE", arquivo.Nome);
+            Log.Ok($"Teste PNCP: {caminho}");
+        }
         return 0;
     }
     finally
@@ -178,10 +272,3 @@ async Task<int> TestarPncpAsync(IBrowserContext context, Configuracao cfgLocal)
         await page.CloseAsync();
     }
 }
-
-// --- 4) Resumo --------------------------------------------------------------
-Log.Secao("RESUMO DA EXECUÇÃO");
-historico.ExibirEstatisticas();
-Log.Info(exitCode == 0 ? "Execução concluída sem falhas." : "Execução concluída com falhas (veja os erros acima).");
-
-return exitCode;

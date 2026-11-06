@@ -28,13 +28,17 @@ public sealed class HistoricoService
         Carregar();
     }
 
-    /// <summary>Considera terminais apenas os status que não devem ser reprocessados.</summary>
+    /// <summary>
+    /// Considera terminais apenas os status que não devem ser reprocessados.
+    /// "erro" e "sem-edital" são tentados de novo a cada ciclo: o órgão costuma
+    /// publicar os arquivos no PNCP depois de divulgar a compra.
+    /// </summary>
     public bool JaProcessada(string chave)
     {
         lock (_lock)
         {
             if (!_itens.TryGetValue(chave, out var registro)) return false;
-            return registro.Status is not StatusLicitacao.Erro;
+            return registro.Status is not (StatusLicitacao.Erro or StatusLicitacao.SemEdital);
         }
     }
 
@@ -43,14 +47,46 @@ public sealed class HistoricoService
         lock (_lock)
         {
             _itens[registro.Chave] = registro;
-
-            string? pasta = Path.GetDirectoryName(_caminho);
-            if (!string.IsNullOrEmpty(pasta)) Directory.CreateDirectory(pasta);
-
-            string temp = _caminho + ".tmp";
-            File.WriteAllText(temp, JsonSerializer.Serialize(_itens.Values.ToList(), Opcoes));
-            File.Move(temp, _caminho, overwrite: true);
+            Gravar();
         }
+    }
+
+    /// <summary>
+    /// Licitações baixadas cujo e-mail ainda NÃO foi enviado (EmailEnviado == false).
+    /// Registros antigos (EmailEnviado == null) nunca são considerados pendentes.
+    /// </summary>
+    public List<LicitacaoHistorico> PendentesDeEmail()
+    {
+        lock (_lock)
+        {
+            return _itens.Values
+                .Where(r => r.Status == StatusLicitacao.Baixado
+                            && r.EmailEnviado == false
+                            && !string.IsNullOrWhiteSpace(r.Arquivo))
+                .ToList();
+        }
+    }
+
+    /// <summary>Marca a licitação como e-mailada e persiste o histórico.</summary>
+    public void MarcarEmailEnviado(string chave)
+    {
+        lock (_lock)
+        {
+            if (!_itens.TryGetValue(chave, out var registro)) return;
+            registro.EmailEnviado = true;
+            Gravar();
+        }
+    }
+
+    /// <summary>Grava o histórico em disco (lock já segurado pelo chamador).</summary>
+    private void Gravar()
+    {
+        string? pasta = Path.GetDirectoryName(_caminho);
+        if (!string.IsNullOrEmpty(pasta)) Directory.CreateDirectory(pasta);
+
+        string temp = _caminho + ".tmp";
+        File.WriteAllText(temp, JsonSerializer.Serialize(_itens.Values.ToList(), Opcoes));
+        File.Move(temp, _caminho, overwrite: true);
     }
 
     public void ExibirEstatisticas()

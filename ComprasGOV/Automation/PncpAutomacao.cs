@@ -4,12 +4,12 @@ using Microsoft.Playwright;
 
 namespace ComprasGOV.Automation;
 
-/// <summary>Arquivo localizado na aba "Arquivos" do PNCP.</summary>
-public sealed record ArquivoEdital(string Url, string Nome);
+/// <summary>Arquivo publicado na aba "Arquivos" do PNCP.</summary>
+public sealed record ArquivoPncp(string Url, string Nome);
 
 /// <summary>
-/// Automação do Portal Nacional de Contratações Públicas: abre o edital correspondente
-/// à compra, acessa a aba "Arquivos" e localiza o documento com tipo "Edital".
+/// Automação do Portal Nacional de Contratações Públicas: abre a compra
+/// correspondente e lê TODOS os arquivos publicados na aba "Arquivos".
 /// </summary>
 public sealed class PncpAutomacao
 {
@@ -72,9 +72,11 @@ public sealed class PncpAutomacao
         return pncp;
     }
 
-    /// <summary>Abre a aba "Arquivos" e procura a linha com tipo "Edital".</summary>
-    public async Task<ArquivoEdital?> LocalizarEditalAsync(IPage pncp)
+    /// <summary>Abre a aba "Arquivos" e lista TODOS os arquivos publicados (com download).</summary>
+    public async Task<List<ArquivoPncp>> ListarArquivosAsync(IPage pncp)
     {
+        var arquivos = new List<ArquivoPncp>();
+
         // O PNCP é uma SPA: a barra de abas só aparece depois dos XHRs iniciais.
         try
         {
@@ -88,7 +90,7 @@ public sealed class PncpAutomacao
         {
             await DiagnosticarAsync(pncp, "barra_abas_ausente");
             Log.Aviso("Barra de abas não encontrada no PNCP (página sem os arquivos da compra ou ainda carregando).");
-            return null;
+            return arquivos;
         }
 
         // Escolhe o primeiro seletor que casa a aba "Arquivos" (ver Seletores).
@@ -106,7 +108,7 @@ public sealed class PncpAutomacao
         {
             await DiagnosticarAsync(pncp, "aba_arquivos_ausente");
             Log.Aviso("Aba 'Arquivos' não encontrada no PNCP (página sem os arquivos da compra).");
-            return null;
+            return arquivos;
         }
 
         Log.Info($"Aba 'Arquivos' localizada (seletor: {seletorUsado}).");
@@ -136,10 +138,8 @@ public sealed class PncpAutomacao
         {
             await DiagnosticarAsync(pncp, "tabela_arquivos_vazia");
             Log.Aviso("Aba 'Arquivos' sem linhas de download (nenhum documento publicado nesta compra).");
-            return null;
+            return arquivos;
         }
-
-        Log.Info($"Tabela de arquivos do PNCP: {total} linha(s) com download.");
 
         for (int i = 0; i < total; i++)
         {
@@ -151,24 +151,6 @@ public sealed class PncpAutomacao
             int qtdCelulas = await celulas.CountAsync();
 
             string nome = qtdCelulas > 0 ? await celulas.Nth(0).InnerTextAsync() : "";
-            string textoLinha = await linha.InnerTextAsync();
-
-            // Coluna "Tipo" (2ª/3ª coluna da tabela de arquivos). Varre as células
-            // a partir da 2ª para não confundir o próprio nome do arquivo com o tipo.
-            string tipo = "";
-            for (int c = 1; c < qtdCelulas; c++)
-            {
-                string t = TextoUtil.LimparEspacos(await celulas.Nth(c).InnerTextAsync());
-                if (t.Contains("Edital", StringComparison.OrdinalIgnoreCase))
-                {
-                    tipo = t;
-                    break;
-                }
-            }
-
-            bool isEdital = !string.IsNullOrEmpty(tipo) ||
-                            textoLinha.Contains("Edital", StringComparison.OrdinalIgnoreCase);
-            if (!isEdital) continue;
 
             string href = await download.First.GetAttributeAsync("href") ?? "";
             if (string.IsNullOrEmpty(href)) continue;
@@ -178,12 +160,17 @@ public sealed class PncpAutomacao
                 : new Uri(new Uri("https://pncp.gov.br"), href).ToString();
 
             string nomeArquivo = TextoUtil.LimparEspacos(nome);
-            Log.Ok($"Edital localizado no PNCP: {nomeArquivo} (tipo: {tipo})");
-            return new ArquivoEdital(url, nomeArquivo);
+            if (string.IsNullOrWhiteSpace(nomeArquivo)) continue;
+
+            arquivos.Add(new ArquivoPncp(url, nomeArquivo));
         }
 
-        Log.Aviso("Nenhum arquivo com tipo 'Edital' na aba 'Arquivos' do PNCP.");
-        return null;
+        if (arquivos.Count == 0)
+            Log.Aviso("Aba 'Arquivos' sem arquivos utilizáveis (nenhum download disponível).");
+        else
+            Log.Ok($"Aba 'Arquivos': {arquivos.Count} arquivo(s) localizado(s) no PNCP.");
+
+        return arquivos;
     }
 
     /// <summary>Grava screenshot e HTML da página para inspeção quando algo não é encontrado.</summary>

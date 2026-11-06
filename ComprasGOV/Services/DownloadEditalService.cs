@@ -22,12 +22,27 @@ public sealed class DownloadEditalService
     {
         Directory.CreateDirectory(_pastaSaida);
 
-        string extensao = Path.GetExtension(nomeOriginal);
+        using HttpResponseMessage resp = await _http.GetAsync(url);
+        resp.EnsureSuccessStatusCode();
+        byte[] conteudo = await resp.Content.ReadAsByteArrayAsync();
+        if (conteudo.Length == 0)
+            throw new InvalidOperationException("O PNCP devolveu um arquivo vazio.");
+
+        // Extensão: do nome no PNCP; senão do nome real do arquivo (Content-Disposition,
+        // ex.: "Edital.zip"); senão .pdf. Evita salvar .zip/.docx com extensão errada.
+        string extensao = ExtensaoValida(nomeOriginal);
+        if (string.IsNullOrEmpty(extensao))
+        {
+            var cd = resp.Content.Headers.ContentDisposition;
+            extensao = ExtensaoValida((cd?.FileNameStar ?? cd?.FileName ?? "").Trim('"'));
+        }
         if (string.IsNullOrEmpty(extensao)) extensao = ".pdf";
 
         string nomeBase = string.IsNullOrWhiteSpace(nomeOriginal)
             ? "edital"
-            : Path.GetFileNameWithoutExtension(nomeOriginal);
+            : string.IsNullOrEmpty(ExtensaoValida(nomeOriginal))
+                ? nomeOriginal
+                : Path.GetFileNameWithoutExtension(nomeOriginal);
 
         string destino = Path.Combine(_pastaSaida, $"{Sanitizar(numeroLicitacao)} - {Sanitizar(nomeBase)}{extensao}");
 
@@ -39,13 +54,18 @@ public sealed class DownloadEditalService
                 $"{Sanitizar(numeroLicitacao)} - {Sanitizar(nomeBase)} ({sufixo++}){extensao}");
         }
 
-        byte[] conteudo = await _http.GetByteArrayAsync(url);
-        if (conteudo.Length == 0)
-            throw new InvalidOperationException("O PNCP devolveu um arquivo vazio.");
-
         await File.WriteAllBytesAsync(destino, conteudo);
         Log.Info($"Download: {conteudo.Length:N0} bytes -> {destino}");
         return destino;
+    }
+
+    /// <summary>Extensão curta e alfanumérica (".pdf", ".zip"); "" para títulos como "Edital 1.2".</summary>
+    private static string ExtensaoValida(string nome)
+    {
+        string ext = Path.GetExtension(nome ?? "");
+        return ext.Length is >= 2 and <= 6 && ext.Skip(1).All(char.IsLetterOrDigit) && ext.Skip(1).Any(char.IsLetter)
+            ? ext.ToLowerInvariant()
+            : "";
     }
 
     private static string Sanitizar(string valor)
