@@ -100,10 +100,17 @@ public sealed class Configuracao
     public string PastaSaida { get; private set; } = PastaSaidaPadrao;
     public string ArquivoHistorico { get; private set; } = CaminhoHistoricoPadrao();
 
+    /// <summary>
+    /// Pasta do "banco de dados" (histórico JSON, cache UASG->CNPJ e relatórios de
+    /// comparação) no servidor, para não depender da máquina que executa.
+    /// Pode ser sobrescrita pela variável de ambiente COMPRASGOV_PASTA_BANCO
+    /// ou, só para o histórico, pelo argumento --historico.
+    /// </summary>
+    public const string PastaBancoServidor = @"\\SERVIDOR2\Publico\ALLAN\database";
+
     private static string CaminhoHistoricoPadrao() =>
         Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-            "ComprasGOV",
+            Environment.GetEnvironmentVariable("COMPRASGOV_PASTA_BANCO") ?? PastaBancoServidor,
             "licitacoes_processadas.json");
 
     public static Configuracao Ler(string[] args)
@@ -239,6 +246,7 @@ public sealed class Configuracao
             Variáveis de ambiente (opcionais, usadas quando o argumento não é informado):
               COMPRASGOV_PLANILHA       Caminho da planilha de órgãos (xlsx).
               COMPRASGOV_PASTA_SAIDA    Pasta onde os arquivos serão salvos.
+              COMPRASGOV_PASTA_BANCO    Pasta do histórico/cache (padrão: \\SERVIDOR2\Publico\ALLAN\database).
               COMPRASGOV_SMTP_SENHA     Senha do remetente (obrigatória para enviar e-mail).
             """);
     }

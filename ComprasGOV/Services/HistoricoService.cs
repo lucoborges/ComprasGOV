@@ -111,8 +111,9 @@ public sealed class HistoricoService
         }
         catch (Exception ex)
         {
-            Log.Aviso($"Falha ao ler histórico ({ex.Message}); seguindo sem histórico.");
-            _itens.Clear();
+            // Nunca seguir com histórico vazio: tudo seria reprocessado e os
+            // e-mails já enviados seriam repetidos. Quem chama adia o ciclo.
+            throw new InvalidOperationException($"Falha ao ler o histórico {_caminho}: {ex.Message}", ex);
         }
     }
 }

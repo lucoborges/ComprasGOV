@@ -50,8 +50,10 @@ Console.CancelKeyPress += (_, e) =>
     }
 };
 
-// Histórico local (não reprocessa o que já foi avaliado) - compartilhado entre ciclos.
-var historico = new HistoricoService(cfg.ArquivoHistorico);
+// Histórico (não reprocessa o que já foi avaliado) - fica no servidor e é
+// carregado no primeiro ciclo em que a pasta estiver acessível.
+HistoricoService historico = null!;
+bool historicoCarregado = false;
 
 // API oficial do PNCP (sem navegador/captcha) - usada pela fonte "api" e pela comparação.
 var api = new PncpApiService(cfg.ArquivoCacheCnpj);
@@ -80,7 +82,7 @@ while (true)
 
     // --- Resumo do ciclo ---------------------------------------------------
     Log.Secao(continuo ? $"RESUMO DO CICLO {ciclo}" : "RESUMO DA EXECUÇÃO");
-    historico.ExibirEstatisticas();
+    if (historicoCarregado) historico.ExibirEstatisticas();
     Log.Info(exitCode == 0 ? "Ciclo concluído sem falhas." : "Ciclo concluído com falhas (veja os erros acima).");
 
     if (!continuo || cancelamento.IsCancellationRequested) break;
@@ -107,6 +109,8 @@ return exitCode;
 // ---------------------------------------------------------------------------
 async Task<int> ExecutarCicloAsync()
 {
+    if (!CarregarHistorico()) return 1;
+
     IReadOnlyList<ClienteUasg>? clientes = CarregarClientes();
     if (clientes is null) return 1;
 
@@ -151,6 +155,37 @@ async Task<int> ExecutarCicloAsync()
     {
         Log.Erro($"Falha na execução: {ex.Message}");
         return 1;
+    }
+}
+
+// Sem acesso ao banco no servidor o ciclo NÃO roda: com o histórico vazio tudo
+// seria reprocessado e os e-mails já enviados seriam repetidos.
+bool CarregarHistorico()
+{
+    if (historicoCarregado) return true;
+
+    string pasta = Path.GetDirectoryName(Path.GetFullPath(cfg.ArquivoHistorico)) ?? ".";
+    try
+    {
+        if (!Directory.Exists(pasta))
+        {
+            // Pasta local (ex.: --historico de teste) pode ser criada; a do servidor não.
+            if (pasta.StartsWith(@"\\", StringComparison.Ordinal))
+            {
+                Log.Erro($"Banco de dados inacessível: {pasta}. Ciclo adiado (nada foi processado).");
+                return false;
+            }
+            Directory.CreateDirectory(pasta);
+        }
+
+        historico = new HistoricoService(cfg.ArquivoHistorico);
+        historicoCarregado = true;
+        return true;
+    }
+    catch (Exception ex)
+    {
+        Log.Erro($"{ex.Message}. Ciclo adiado (nada foi processado).");
+        return false;
     }
 }
 

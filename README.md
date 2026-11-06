@@ -156,7 +156,7 @@ dotnet run --project ComprasGOV/ComprasGOV.csproj --no-build -- --uasg 90014
 7. **Download** → baixa o arquivo como
    `<número> - <nome original no PNCP><extensão original>` para a pasta de saída.
 8. **Histórico** → grava o status em
-   `Documents\ComprasGOV\licitacoes_processadas.json`
+   `\\SERVIDOR2\Publico\ALLAN\database\licitacoes_processadas.json`
    (ou o caminho indicado por `--historico`).
 
 ## Estrutura do projeto
@@ -183,6 +183,13 @@ ComprasGOV/
 ```
 
 ## Notas práticas
+
+- **Banco de dados no servidor**: o histórico, o cache `uasg_cnpj.json` e os
+  relatórios de comparação ficam em `\\SERVIDOR2\Publico\ALLAN\database`
+  (altere com a variável `COMPRASGOV_PASTA_BANCO`). Se a pasta estiver
+  inacessível ou o histórico ilegível, o ciclo **não roda** e é tentado de novo
+  no próximo: com histórico vazio, tudo seria reprocessado e os e-mails já
+  enviados seriam repetidos.
 
 - **hCaptcha** (só na fonte `portal`): o portal exige desafio de vez em quando. Quando aparece, um
   aviso é impresso no console e a janela do navegador fica visível — resolva o
