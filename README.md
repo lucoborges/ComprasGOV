@@ -1,10 +1,20 @@
 # ComprasGOV
 
-Automação em **.NET 8** que busca as licitações **com proposta em aberto** de
-cada UASG (lida de uma planilha Excel), aplica a regra de validade do objeto,
-**baixa todos os arquivos** publicados no **PNCP** para uma pasta de destino e
-envia por e-mail, mantendo um histórico local em JSON para nunca processar
-duas vezes a mesma licitação. Roda 24/7, em ciclos com pausa de 1h.
+Automação em **.NET 8** que busca as licitações **com proposta em aberto**,
+aplica a regra de validade do objeto, **baixa todos os arquivos** publicados no
+**PNCP** para uma pasta de destino e envia por e-mail, mantendo um histórico em
+JSON para nunca processar duas vezes a mesma licitação. Roda 24/7, em ciclos com
+pausa de 1h. Cada ciclo executa duas tarefas, nesta ordem:
+
+1. **Tarefa específica** — as UASGs da planilha Excel de clientes;
+2. **Tarefa geral** — todas as licitações do PNCP com os filtros
+   **UF = ES** e **Fontes/Plataformas = Compras.gov.br e PORTAL GOV SERVICOS
+   DIGITAIS LTDA / PORTAL GOV** (os mesmos filtros da tela *Editais* do site do PNCP).
+
+As duas usam as mesmas regras (só licitações **divulgadas** e com **prazo de
+proposta em aberto**; suspensas, revogadas, anuladas e canceladas são
+ignoradas), a mesma regra de válido/inválido do objeto, o mesmo download e o
+mesmo e-mail. O que uma tarefa já processou a outra não repete.
 
 ## Fontes de dados
 
@@ -22,6 +32,33 @@ novo no próximo ciclo, então nenhuma licitação se perde.
 `--comparar` executa as duas fontes lado a lado (sem baixar nada) e salva um
 relatório `comparacao_<data>.md` ao lado do histórico.
 
+## Busca geral (UF + fontes/plataformas)
+
+Depois das UASGs da planilha, o ciclo busca as licitações do **ES** publicadas
+no PNCP pelas plataformas **Compras.gov.br** e **PORTAL GOV SERVICOS DIGITAIS
+LTDA / PORTAL GOV** — o equivalente aos filtros *Status: A Receber/Recebendo
+Proposta*, *UFs* e *Fontes/Plataformas* da tela
+[Editais](https://pncp.gov.br/app/editais) do PNCP:
+
+- **Fonte principal:** API oficial de consulta do PNCP
+  (`/v1/contratacoes/proposta?uf=ES&idUsuario=<plataforma>`), com as que estão
+  recebendo propostas;
+- **Complemento:** uma consulta por ciclo à busca do próprio site, que também
+  traz as que ainda vão abrir o prazo (*a receber*). Ela é instável (às vezes o
+  servidor derruba a conexão); quando falha, essas licitações entram no ciclo em
+  que o prazo abrir, pela API oficial.
+
+UF e plataformas ficam em `Config/Configuracao.cs` (`UfsBuscaGeral` e
+`PlataformasBuscaGeral`; o código da plataforma é o do filtro do site, ex.:
+`3` = Compras.gov.br, `350` = PORTAL GOV). No e-mail, a linha "UASG" das
+licitações da busca geral traz também o nome da unidade compradora, já que o
+órgão não vem da planilha de clientes.
+
+> **Primeiro ciclo:** a busca geral avalia de uma vez todas as licitações em
+> aberto no ES (≈ 120 em nov/2026) e envia por e-mail as válidas (2 a 4 por
+> mensagem); dali em diante, só as novas. Para espalhar esse volume por vários
+> ciclos, use `--max <n>`.
+
 ## Funcionalidades
 
 - Lê os códigos de **UASG** de uma planilha Excel (coluna `Código UASG`).
@@ -37,7 +74,8 @@ relatório `comparacao_<data>.md` ao lado do histórico.
 - **Histórico JSON** local: cada licitação recebe um status
   (`baixado`, `rejeitado`, `indefinido`, `sem-edital`, `erro`) e só
   `erro` e `sem-edital` são reprocessados no ciclo seguinte (o órgão costuma
-  publicar os arquivos no PNCP depois de divulgar a compra).
+  publicar os arquivos no PNCP depois de divulgar a compra). A chave de cada
+  licitação é o **número de controle do PNCP** (ex.: `00394452000103-1-023561/2026`).
 - Perfil de navegador persistente + medidas anti-detecção para reduzir os
   desafios de **hCaptcha** (com aviso na janela e retry automático).
 
@@ -101,26 +139,28 @@ caminhos internos:**
 ## Uso
 
 ```powershell
-# primeiro cliente da planilha (padrão)
+# padrão: todos os clientes da planilha + busca geral, 24/7
 dotnet run --project ComprasGOV/ComprasGOV.csproj --no-build
 
-# todos os clientes da planilha
-dotnet run --project ComprasGOV/ComprasGOV.csproj --no-build -- --todos
-
-# um órgão específico, sem planilha
+# um órgão específico, sem planilha (e sem a busca geral)
 dotnet run --project ComprasGOV/ComprasGOV.csproj --no-build -- --uasg 90014
+
+# só a busca geral (ES + plataformas), um ciclo, sem enviar e-mail
+dotnet run --project ComprasGOV/ComprasGOV.csproj --no-build -- --so-busca-geral --uma-vez --sem-email
 ```
 
 | Opção | Descrição |
 |---|---|
-| `--uasg <codigo>` | Processa apenas o código UASG informado (ex.: `90014`). |
-| `--todos` | Processa todos os clientes da planilha (padrão: só o primeiro). |
+| `--uasg <codigo>` | Processa apenas o código UASG informado (ex.: `90014`), sem a busca geral. |
+| `--sem-busca-geral` | Executa só a tarefa de UASGs da planilha. |
+| `--so-busca-geral` | Executa só a busca geral (UF + fontes/plataformas). |
+| `--todos` | Sem efeito: o padrão já processa todos os clientes da planilha. |
 | `--headless` | Executa sem janela do navegador (padrão: janela visível). **Não recomendado**: em headless o hCaptcha sempre exige o desafio de imagens e a pesquisa não avança. |
 | `--fonte <api\|portal>` | Origem das licitações (padrão: `api`, sem navegador/captcha). |
 | `--comparar` | Compara portal x API por UASG e salva um relatório (não baixa, não grava histórico). |
 | `--uma-vez` | Executa um único ciclo e encerra (padrão: modo contínuo 24/7). |
 | `--intervalo <min>` | Pausa entre ciclos no modo contínuo (padrão: 60 minutos). |
-| `--max <n>` | Limita a quantidade de licitações processadas por ciclo. |
+| `--max <n>` | Limita a quantidade de licitações processadas por ciclo (somando as duas tarefas). |
 | `--planilha <caminho>` | Caminho da planilha de órgãos (xlsx). |
 | `--pasta-saida <caminho>` | Pasta onde os editais serão salvos. |
 | `--historico <arquivo>` | Arquivo JSON de licitações já processadas. |
@@ -139,7 +179,11 @@ dotnet run --project ComprasGOV/ComprasGOV.csproj --no-build -- --uasg 90014
    pelo CNPJ e pela UASG; ignora compras suspensas/revogadas/anuladas.
 4. **Regra do objeto** → igual à do portal.
 5. **Arquivos** → lista os arquivos ativos da compra no PNCP e baixa todos.
-6. **Histórico e e-mail** → iguais aos do portal.
+6. **Busca geral** → lista as licitações do ES nas plataformas configuradas
+   (API oficial + busca do site) e aplica os passos 3 a 5 ao que ainda não foi
+   processado (inclusive pela tarefa de UASGs no mesmo ciclo).
+7. **Histórico e e-mail** → iguais aos do portal; os e-mails saem uma vez, no
+   fim do ciclo, com os downloads das duas tarefas.
 
 ## Como funciona (fonte portal)
 
@@ -165,7 +209,7 @@ dotnet run --project ComprasGOV/ComprasGOV.csproj --no-build -- --uasg 90014
 ComprasGOV.slnx
 ComprasGOV/
 ├── Program.cs                 # CLI, perfil persistente do Chromium, modo --testar-pncp
-├── ExecutadorFluxo.cs         # orquestração do fluxo (API ou portal) e e-mails
+├── ExecutadorFluxo.cs         # tarefas do ciclo (UASGs via API/portal, busca geral) e e-mails
 ├── ComparadorFontes.cs        # modo --comparar (portal x API)
 ├── Config/Configuracao.cs     # argumentos, variáveis de ambiente e padrões
 ├── Automation/
@@ -174,7 +218,7 @@ ComprasGOV/
 │   └── Seletores.cs           # seletores CSS/Playwright centralizados
 ├── Models/                    # ClienteUasg, LicitacaoEncontrada, LicitacaoHistorico
 └── Services/
-    ├── PncpApiService.cs      # APIs oficiais: UASG->CNPJ, propostas abertas, arquivos
+    ├── PncpApiService.cs      # APIs: UASG->CNPJ, propostas abertas (UASG ou UF+plataforma), busca do site, arquivos
     ├── PlanilhaService.cs     # leitura da planilha (ClosedXML)
     ├── ClassificadorObjeto.cs # regra VÁLIDO/INVÁLIDO/indefinido
     ├── DownloadEditalService.cs
@@ -190,6 +234,19 @@ ComprasGOV/
   inacessível ou o histórico ilegível, o ciclo **não roda** e é tentado de novo
   no próximo: com histórico vazio, tudo seria reprocessado e os e-mails já
   enviados seriam repetidos.
+- **Chave do histórico**: a chave antiga `UASG-número/ano` colidia quando o
+  mesmo órgão usa o mesmo número em modalidades diferentes (ex.: Pregão
+  90015/2026 e Concorrência 90015/2026 da mesma UASG) e a segunda licitação era
+  descartada como "já processada". Agora a chave é o número de controle do
+  PNCP. Na primeira carga, os registros antigos são migrados automaticamente
+  (a partir do link do PNCP gravado em cada um) e o arquivo original é copiado
+  para `licitacoes_processadas.json.antes-migracao-<data>`. Registros antigos
+  sem link (rejeitados/indefinidos do fluxo do portal) são reavaliados uma vez,
+  sem download nem e-mail. O arquivo passa a ter um formato novo
+  (`{"Versao":2,"Itens":[...]}`): uma versão antiga do programa não consegue
+  lê-lo e adia o ciclo (em vez de reprocessar e reenviar tudo) — atualize
+  **todas** as máquinas que rodam o sistema. `--comparar` e `--testar-pncp`
+  só leem o histórico, sem regravá-lo.
 
 - **hCaptcha** (só na fonte `portal`): o portal exige desafio de vez em quando. Quando aparece, um
   aviso é impresso no console e a janela do navegador fica visível — resolva o

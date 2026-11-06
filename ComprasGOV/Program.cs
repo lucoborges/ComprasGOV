@@ -6,10 +6,11 @@ using ComprasGOV.Services;
 using Microsoft.Playwright;
 
 // ---------------------------------------------------------------------------
-//  ComprasGOV - busca as licitações com proposta em aberto por UASG (API
-//  oficial do PNCP, padrão; ou o portal Compras.gov.br pelo navegador), valida
-//  o objeto, baixa TODOS os arquivos do PNCP para a pasta de rede e envia por
-//  e-mail (2 a 4 licitações por mensagem). Roda 24/7 em ciclos.
+//  ComprasGOV - busca as licitações com proposta em aberto (1) por UASG da
+//  planilha de clientes (API oficial do PNCP, padrão; ou o portal Compras.gov.br
+//  pelo navegador) e (2) na busca geral do PNCP por UF e fontes/plataformas;
+//  valida o objeto, baixa TODOS os arquivos do PNCP para a pasta de rede e envia
+//  por e-mail (2 a 4 licitações por mensagem). Roda 24/7 em ciclos.
 // ---------------------------------------------------------------------------
 
 Configuracao cfg = Configuracao.Ler(args);
@@ -55,16 +56,36 @@ Console.CancelKeyPress += (_, e) =>
 HistoricoService historico = null!;
 bool historicoCarregado = false;
 
-// API oficial do PNCP (sem navegador/captcha) - usada pela fonte "api" e pela comparação.
+// API oficial do PNCP (sem navegador/captcha) - usada pela fonte "api", pela busca
+// geral e pela comparação.
 var api = new PncpApiService(cfg.ArquivoCacheCnpj);
 
-bool usaNavegador = cfg.UsarPortal || cfg.Comparar || !string.IsNullOrWhiteSpace(cfg.TestarPncpUrl);
-Log.Info(cfg.Comparar ? "Modo: COMPARAÇÃO portal x API (não baixa, não envia e-mail)."
-       : usaNavegador ? "Fonte: portal Compras.gov.br (navegador; sujeito ao hCaptcha)."
-       : "Fonte: API oficial do PNCP (sem navegador e sem captcha).");
+// --testar-pncp e --comparar são modos de teste/diagnóstico de execução única.
+bool modoEspecial = cfg.Comparar || !string.IsNullOrWhiteSpace(cfg.TestarPncpUrl);
 
-// --testar-pncp e --comparar são sempre execução única.
-bool continuo = cfg.Continuo && !cfg.Comparar && string.IsNullOrWhiteSpace(cfg.TestarPncpUrl);
+if (cfg.Comparar)
+{
+    Log.Info("Modo: COMPARAÇÃO portal x API (não baixa, não envia e-mail).");
+}
+else if (!modoEspecial)
+{
+    if (!cfg.ExecutarTarefaUasg && !cfg.ExecutarBuscaGeral)
+    {
+        Log.Erro("Nenhuma tarefa habilitada: --sem-busca-geral e --so-busca-geral juntos.");
+        return 1;
+    }
+
+    if (cfg.ExecutarTarefaUasg)
+        Log.Info("Tarefa específica (UASGs da planilha): " + (cfg.UsarPortal
+            ? "portal Compras.gov.br (navegador; sujeito ao hCaptcha)."
+            : "API oficial do PNCP (sem navegador e sem captcha)."));
+
+    if (cfg.ExecutarBuscaGeral)
+        Log.Info($"Tarefa geral (depois da específica): UF {string.Join(", ", Configuracao.UfsBuscaGeral)}; " +
+                 $"fontes/plataformas {string.Join(" e ", Configuracao.PlataformasBuscaGeral.Values)}.");
+}
+
+bool continuo = cfg.Continuo && !modoEspecial;
 if (continuo)
     Log.Info($"Modo contínuo (24/7): pausa de {cfg.IntervaloMinutos} min entre ciclos. " +
              "Use --uma-vez para um único ciclo; Ctrl+C para encerrar.");
@@ -103,28 +124,97 @@ Log.Info("ComprasGOV encerrado.");
 return exitCode;
 
 // ---------------------------------------------------------------------------
-//  Um ciclo completo: lê os clientes, processa (pela API ou pelo navegador),
-//  envia os e-mails. No modo portal abre/fecha o navegador a cada ciclo (evita
+//  Um ciclo completo: (1) tarefa específica - UASGs da planilha (pela API ou pelo
+//  navegador); (2) tarefa geral - UF + fontes/plataformas no PNCP; (3) e-mails
+//  de tudo o que foi baixado. Uma tarefa que falhar não impede a outra nem o
+//  envio dos e-mails. No modo portal abre/fecha o navegador a cada ciclo (evita
 //  acúmulo de memória e recupera quedas do Chromium). Nunca lança exceção.
 // ---------------------------------------------------------------------------
 async Task<int> ExecutarCicloAsync()
 {
     if (!CarregarHistorico()) return 1;
+    if (modoEspecial) return await ExecutarModoEspecialAsync();
+
+    var fluxo = new ExecutadorFluxo(cfg, historico);
+    int falhas = 0;
+
+    // 1) Tarefa específica: UASGs da planilha de clientes.
+    if (cfg.ExecutarTarefaUasg)
+        falhas += await ExecutarTarefaUasgAsync(fluxo);
+
+    // 2) Tarefa geral: UF + fontes/plataformas (mesmos filtros do site do PNCP).
+    if (cfg.ExecutarBuscaGeral && !cancelamento.IsCancellationRequested)
+    {
+        try
+        {
+            falhas += await fluxo.ProcessarBuscaGeralAsync(api, cancelamento.Token);
+        }
+        catch (Exception ex)
+        {
+            falhas++;
+            Log.Erro($"Falha na busca geral: {ex.Message}");
+        }
+    }
+
+    // 3) E-mails: downloads deste ciclo (das duas tarefas) + pendências anteriores.
+    try
+    {
+        falhas += await fluxo.EnviarEmailsAsync();
+    }
+    catch (Exception ex)
+    {
+        falhas++;
+        Log.Erro($"Falha no envio dos e-mails: {ex.Message}");
+    }
+
+    return falhas == 0 ? 0 : 1;
+}
+
+// Tarefa específica: lê os clientes (UASG) e processa pela API ou pelo navegador.
+async Task<int> ExecutarTarefaUasgAsync(ExecutadorFluxo fluxo)
+{
+    Log.Secao("TAREFA ESPECÍFICA - UASGs DA PLANILHA DE CLIENTES");
 
     IReadOnlyList<ClienteUasg>? clientes = CarregarClientes();
     if (clientes is null) return 1;
 
-    if (!usaNavegador)
+    try
     {
+        if (!cfg.UsarPortal)
+            return await fluxo.ProcessarUasgsViaApiAsync(api, clientes, cancelamento.Token);
+
+        using IPlaywright pw = await Playwright.CreateAsync();
+        IBrowserContext context = await CriarContextoAsync(pw);
+
         try
         {
-            return await new ExecutadorFluxo(cfg, historico).ExecutarViaApiAsync(api, clientes, cancelamento.Token);
+            return await fluxo.ProcessarUasgsViaPortalAsync(context, clientes, cancelamento.Token);
         }
-        catch (Exception ex)
+        finally
         {
-            Log.Erro($"Falha na execução: {ex.Message}");
-            return 1;
+            try { await context.CloseAsync(); } catch { /* navegador já caiu */ }
         }
+    }
+    catch (PlaywrightException ex)
+    {
+        Log.Erro($"Falha do navegador/Playwright: {ex.Message}");
+        return 1;
+    }
+    catch (Exception ex)
+    {
+        Log.Erro($"Falha na tarefa de UASGs: {ex.Message}");
+        return 1;
+    }
+}
+
+// --comparar (portal x API por UASG) e --testar-pncp: sempre pelo navegador.
+async Task<int> ExecutarModoEspecialAsync()
+{
+    IReadOnlyList<ClienteUasg>? clientes = null;
+    if (cfg.Comparar)
+    {
+        clientes = CarregarClientes();
+        if (clientes is null) return 1;
     }
 
     try
@@ -134,12 +224,9 @@ async Task<int> ExecutarCicloAsync()
 
         try
         {
-            if (cfg.Comparar)
-                return await new ComparadorFontes(cfg, historico, api).ExecutarAsync(context, clientes, cancelamento.Token);
-
-            return !string.IsNullOrWhiteSpace(cfg.TestarPncpUrl)
-                ? await TestarPncpAsync(context, cfg)
-                : await new ExecutadorFluxo(cfg, historico).ExecutarAsync(context, clientes, cancelamento.Token);
+            return clientes is not null
+                ? await new ComparadorFontes(cfg, historico, api).ExecutarAsync(context, clientes, cancelamento.Token)
+                : await TestarPncpAsync(context, cfg);
         }
         finally
         {
@@ -178,7 +265,8 @@ bool CarregarHistorico()
             Directory.CreateDirectory(pasta);
         }
 
-        historico = new HistoricoService(cfg.ArquivoHistorico);
+        // Nos modos de diagnóstico o histórico é só lido (nada é regravado no servidor).
+        historico = new HistoricoService(cfg.ArquivoHistorico, somenteLeitura: modoEspecial);
         historicoCarregado = true;
         return true;
     }

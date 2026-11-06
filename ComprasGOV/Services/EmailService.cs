@@ -2,21 +2,46 @@ using System.IO.Compression;
 using System.Net;
 using System.Net.Mail;
 using System.Text;
+using ComprasGOV.Models;
 
 namespace ComprasGOV.Services;
 
 /// <summary>Licitação com arquivos baixados a ser incluída em um e-mail.</summary>
-/// <param name="Chave">Chave única no histórico ("&lt;UASG&gt;-&lt;número&gt;").</param>
-/// <param name="Uasg">Código da UASG (unidade compradora).</param>
+/// <param name="Chave">Chave única no histórico (número de controle do PNCP).</param>
+/// <param name="Uasg">UASG (unidade compradora) como aparece no corpo do e-mail.</param>
 /// <param name="Numero">Número/identificação da licitação (modalidade + número).</param>
 /// <param name="Objeto">Texto do objeto da licitação.</param>
 /// <param name="Arquivos">Caminhos dos arquivos baixados do PNCP.</param>
+/// <param name="NomeAnexo">Nome base do .zip quando há 2 ou mais arquivos ("UASG-número/ano").</param>
 public sealed record ItemEmail(
     string Chave,
     string Uasg,
     string Numero,
     string Objeto,
-    IReadOnlyList<string> Arquivos);
+    IReadOnlyList<string> Arquivos,
+    string NomeAnexo)
+{
+    /// <summary>
+    /// Item a partir do registro do histórico (downloads do ciclo e pendências anteriores).
+    /// Na busca geral o órgão não vem da planilha de clientes, então a linha "UASG" traz
+    /// também o nome da unidade (e a plataforma, quando não é o Compras.gov.br).
+    /// </summary>
+    public static ItemEmail DeRegistro(LicitacaoHistorico registro, IReadOnlyList<string> arquivos)
+    {
+        string uasg = registro.Uasg;
+        if (registro.Origem == OrigemLicitacao.Geral)
+        {
+            if (!string.IsNullOrWhiteSpace(registro.UasgNome))
+                uasg += $" - {registro.UasgNome}";
+            if (!string.IsNullOrWhiteSpace(registro.Plataforma) &&
+                !registro.Plataforma.Equals("Compras.gov.br", StringComparison.OrdinalIgnoreCase))
+                uasg += $" ({registro.Plataforma})";
+        }
+
+        return new ItemEmail(registro.Chave, uasg, registro.Titulo, registro.Objeto, arquivos,
+            $"{registro.Uasg}-{registro.Numero}");
+    }
+}
 
 /// <summary>
 /// E-mail das licitações com arquivos: agrupa de 2 a 4 licitações por mensagem,
@@ -81,8 +106,11 @@ public sealed class EmailService
         string pasta = Path.Combine(Path.GetTempPath(), "ComprasGOV", "emails");
         Directory.CreateDirectory(pasta);
 
-        string zip = Path.Combine(pasta,
-            $"{Sanitizar(nomeBase)}_{DateTime.Now:yyyyMMdd_HHmmss_fff}.zip");
+        // Duas licitações do mesmo lote podem ter o mesmo "UASG-número" (modalidades diferentes).
+        string nome = $"{Sanitizar(nomeBase)}_{DateTime.Now:yyyyMMdd_HHmmss_fff}";
+        string zip = Path.Combine(pasta, nome + ".zip");
+        for (int i = 2; File.Exists(zip); i++)
+            zip = Path.Combine(pasta, $"{nome}_{i}.zip");
 
         using (var fs = new FileStream(zip, FileMode.CreateNew))
         using (var arquivo = new ZipArchive(fs, ZipArchiveMode.Create))

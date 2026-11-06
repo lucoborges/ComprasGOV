@@ -19,14 +19,36 @@ public static class StatusLicitacao
     public const string Erro = "erro";
 }
 
+/// <summary>Tarefa que encontrou a licitação.</summary>
+public static class OrigemLicitacao
+{
+    /// <summary>Tarefa específica: UASGs da planilha de clientes.</summary>
+    public const string Uasg = "uasg";
+
+    /// <summary>Tarefa geral: busca por UF e fontes/plataformas (filtros do site do PNCP).</summary>
+    public const string Geral = "geral";
+}
+
 /// <summary>Registro persistido em JSON para não reprocessar a mesma licitação.</summary>
 public sealed class LicitacaoHistorico
 {
-    /// <summary>Chave única: "&lt;UASG&gt;-&lt;número&gt;" (ex.: 90014-67/2026).</summary>
+    /// <summary>
+    /// Chave única: número de controle da compra no PNCP (ex.: 00394452000103-1-023561/2026).
+    /// Registros antigos usavam "&lt;UASG&gt;-&lt;número&gt;" (ex.: 90014-67/2026) e são migrados
+    /// na carga do histórico; o fluxo do portal (--fonte portal) ainda grava nesse formato.
+    /// </summary>
     public string Chave { get; set; } = "";
 
+    /// <summary>Código da unidade compradora (no Compras.gov.br, a UASG).</summary>
     public string Uasg { get; set; } = "";
     public string UasgNome { get; set; } = "";
+
+    /// <summary>Ver <see cref="OrigemLicitacao"/> ("" em registros antigos: tarefa por UASG).</summary>
+    public string Origem { get; set; } = "";
+
+    /// <summary>Fonte/plataforma que publicou a compra no PNCP (ex.: "Compras.gov.br").</summary>
+    public string Plataforma { get; set; } = "";
+
     public string Titulo { get; set; } = "";
     public string Numero { get; set; } = "";
     public string Objeto { get; set; } = "";

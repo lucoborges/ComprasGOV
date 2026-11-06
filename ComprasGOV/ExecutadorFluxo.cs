@@ -7,10 +7,12 @@ using Microsoft.Playwright;
 namespace ComprasGOV;
 
 /// <summary>
-/// Orquestra o fluxo completo:
-/// pesquisa -> filtra proposta em aberto -> valida objeto -> acompanha a compra ->
-/// abre o PNCP -> baixa TODOS os arquivos -> registra no histórico ->
-/// no fim, agrupa as licitações (2 a 4 por mensagem) e envia os e-mails.
+/// Orquestra as tarefas de um ciclo (chamadas nesta ordem pelo Program):
+/// 1) tarefa específica - UASGs da planilha de clientes (API do PNCP ou portal);
+/// 2) tarefa geral - busca por UF e fontes/plataformas (filtros do site do PNCP).
+/// Nas duas: proposta em aberto e situação "divulgada" -> valida objeto -> baixa
+/// TODOS os arquivos do PNCP -> registra no histórico.
+/// 3) No fim, agrupa as licitações (2 a 4 por mensagem) e envia os e-mails.
 /// </summary>
 public sealed class ExecutadorFluxo
 {
@@ -24,6 +26,27 @@ public sealed class ExecutadorFluxo
     /// <summary>Licitações com arquivos baixados NESTA execução (aguardando e-mail).</summary>
     private readonly List<ItemEmail> _paraEmail = new();
 
+    /// <summary>Licitações avaliadas neste ciclo: a busca geral não repete o que a tarefa por UASG já avaliou.</summary>
+    private readonly HashSet<string> _avaliadasNoCiclo = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Chaves antigas ("UASG-número/ano") avaliadas neste ciclo pelo fluxo do portal.</summary>
+    private readonly HashSet<string> _avaliadasPortalNoCiclo = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Licitações avaliadas neste ciclo (o limite --max vale para as duas tarefas).</summary>
+    private int _processadasNoCiclo;
+
+    /// <summary>Sinal de encerramento (Ctrl+C): para entre licitações, sem cortar uma no meio.</summary>
+    private CancellationToken _cancelamento;
+
+    /// <summary>Quem encontrou a licitação: dados gravados no histórico e usados no e-mail.</summary>
+    private sealed record Contexto(string Uasg, string UasgNome, string Origem, string Plataforma = "")
+    {
+        public static Contexto DeCliente(ClienteUasg cliente, string plataforma = "") =>
+            new(cliente.Codigo, cliente.Orgao, OrigemLicitacao.Uasg, plataforma);
+
+        public string Descricao => Origem == OrigemLicitacao.Geral ? $"{Uasg} - {UasgNome}" : $"UASG {Uasg}";
+    }
+
     public ExecutadorFluxo(Configuracao cfg, HistoricoService historico)
     {
         _cfg = cfg;
@@ -32,10 +55,12 @@ public sealed class ExecutadorFluxo
         _email = new EmailService(cfg);
     }
 
-    /// <summary>Sinal de encerramento (Ctrl+C): para entre licitações, sem cortar uma no meio.</summary>
-    private CancellationToken _cancelamento;
+    // ------------------------------------------------------------------
+    //  Tarefa específica pelo portal Compras.gov.br (navegador)
+    // ------------------------------------------------------------------
 
-    public async Task<int> ExecutarAsync(IBrowserContext context, IReadOnlyList<ClienteUasg> clientes,
+    /// <summary>Processa as UASGs pelo portal. Devolve a quantidade de falhas.</summary>
+    public async Task<int> ProcessarUasgsViaPortalAsync(IBrowserContext context, IReadOnlyList<ClienteUasg> clientes,
         CancellationToken cancelamento = default)
     {
         _cancelamento = cancelamento;
@@ -57,10 +82,7 @@ public sealed class ExecutadorFluxo
             }
         }
 
-        // Fase final: envia os e-mails (esta execução + pendências anteriores).
-        falhas += await EnviarEmailsAsync();
-
-        return falhas == 0 ? 0 : 1;
+        return falhas;
     }
 
     private async Task ExecutarClienteAsync(IBrowserContext context, ClienteUasg cliente)
@@ -76,7 +98,6 @@ public sealed class ExecutadorFluxo
             await _compras.PesquisarAsync(page, cliente);
 
             int pagina = 1;
-            int processadas = 0;
 
             while (true)
             {
@@ -87,14 +108,13 @@ public sealed class ExecutadorFluxo
                 {
                     if (_cancelamento.IsCancellationRequested) return;
 
-                    if (_cfg.MaxLicitacoes.HasValue && processadas >= _cfg.MaxLicitacoes.Value)
+                    if (LimiteAtingido())
                     {
-                        Log.Aviso($"Limite de {_cfg.MaxLicitacoes.Value} licitação(ões) por execução atingido.");
+                        Log.Aviso($"Limite de {_cfg.MaxLicitacoes} licitação(ões) por ciclo atingido.");
                         return;
                     }
 
                     await ProcessarLicitacaoAsync(page, cliente, alvo, pagina);
-                    processadas++;
                 }
 
                 if (_cancelamento.IsCancellationRequested) return;
@@ -102,7 +122,7 @@ public sealed class ExecutadorFluxo
                 pagina++;
             }
 
-            Log.Info($"Cliente {cliente.Codigo} concluído ({processadas} licitação(ões) avaliadas nesta execução).");
+            Log.Info($"Cliente {cliente.Codigo} concluído.");
         }
         finally
         {
@@ -113,13 +133,17 @@ public sealed class ExecutadorFluxo
 
     private async Task ProcessarLicitacaoAsync(IPage page, ClienteUasg cliente, LicitacaoEncontrada alvo, int pagina)
     {
+        var ctx = Contexto.DeCliente(cliente);
+        _processadasNoCiclo++;
+        _avaliadasPortalNoCiclo.Add($"{SemZeros(cliente.Codigo)}-{alvo.Numero}");
+
         Log.Secao($"LICITAÇÃO {alvo.Titulo} (UASG {cliente.Codigo})");
         if (!string.IsNullOrEmpty(alvo.Objeto))
             Log.Info($"Objeto: {alvo.Objeto}");
         else
             Log.Aviso("Objeto não encontrado no card.");
 
-        if (!ObjetoAprovado(cliente, alvo)) return;
+        if (!ObjetoAprovado(ctx, alvo)) return;
 
         IPage? pncp = null;
         try
@@ -130,7 +154,7 @@ public sealed class ExecutadorFluxo
             if (card is null)
             {
                 Log.Aviso($"Card da licitação não encontrado na lista: {alvo.Titulo}");
-                _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.Erro,
+                _historico.Salvar(NovoRegistro(ctx, alvo, StatusLicitacao.Erro,
                     motivo: "Card não encontrado na lista de resultados"));
                 return;
             }
@@ -141,7 +165,7 @@ public sealed class ExecutadorFluxo
             pncp = await _pncp.AbrirPncpAsync(page);
             if (pncp is null)
             {
-                _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.Erro,
+                _historico.Salvar(NovoRegistro(ctx, alvo, StatusLicitacao.Erro,
                     motivo: "Não foi possível abrir o PNCP", urlCompras: page.Url));
                 return;
             }
@@ -149,7 +173,7 @@ public sealed class ExecutadorFluxo
             var arquivos = await _pncp.ListarArquivosAsync(pncp);
             if (arquivos.Count == 0)
             {
-                _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.SemEdital,
+                _historico.Salvar(NovoRegistro(ctx, alvo, StatusLicitacao.SemEdital,
                     motivo: "Nenhum arquivo publicado na aba 'Arquivos' do PNCP",
                     urlCompras: page.Url, urlPncp: pncp.Url));
                 Log.Aviso("PNCP sem arquivos publicados; seguindo para a próxima licitação.");
@@ -161,20 +185,21 @@ public sealed class ExecutadorFluxo
             foreach (ArquivoPncp arquivo in arquivos)
                 caminhos.Add(await _download.BaixarAsync(arquivo.Url, alvo.Numero, arquivo.Nome));
 
-            _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.Baixado,
+            LicitacaoHistorico registro = NovoRegistro(ctx, alvo, StatusLicitacao.Baixado,
                 urlCompras: page.Url, urlPncp: pncp.Url,
                 arquivo: string.Join("\n", caminhos),
-                emailEnviado: false));
+                emailEnviado: false);
+            _historico.Salvar(registro);
 
             Log.Ok($"{caminhos.Count} arquivo(s) salvo(s) na pasta de saída.");
 
             // Entra na fila de e-mail desta execução.
-            _paraEmail.Add(new ItemEmail(alvo.Chave, cliente.Codigo, alvo.Titulo, alvo.Objeto, caminhos));
+            _paraEmail.Add(ItemEmail.DeRegistro(registro, caminhos));
         }
         catch (Exception ex)
         {
             Log.Erro($"Erro ao processar {alvo.Titulo}: {ex.Message}");
-            _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.Erro,
+            _historico.Salvar(NovoRegistro(ctx, alvo, StatusLicitacao.Erro,
                 motivo: ex.Message, urlCompras: page.Url, urlPncp: pncp?.Url ?? ""));
         }
         finally
@@ -192,7 +217,7 @@ public sealed class ExecutadorFluxo
     /// Regra de validade do HTML.md (termos inválidos vencem). Registra no histórico
     /// as licitações rejeitadas/indefinidas e devolve true quando deve baixar.
     /// </summary>
-    private bool ObjetoAprovado(ClienteUasg cliente, LicitacaoEncontrada alvo,
+    private bool ObjetoAprovado(Contexto ctx, LicitacaoEncontrada alvo,
         string urlCompras = "", string urlPncp = "")
     {
         Classificacao classificacao = ClassificadorObjeto.Classificar(alvo.Objeto);
@@ -206,7 +231,7 @@ public sealed class ExecutadorFluxo
 
         if (classificacao == Classificacao.Invalido)
         {
-            _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.Rejeitado,
+            _historico.Salvar(NovoRegistro(ctx, alvo, StatusLicitacao.Rejeitado,
                 motivo: "Objeto inválido (serviço, locação, produtos químicos ou medicamentos)",
                 urlCompras: urlCompras, urlPncp: urlPncp));
             Log.Aviso("Licitação rejeitada pela regra do objeto; nada será baixado.");
@@ -215,7 +240,7 @@ public sealed class ExecutadorFluxo
 
         if (classificacao == Classificacao.Indefinido)
         {
-            _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.Indefinido,
+            _historico.Salvar(NovoRegistro(ctx, alvo, StatusLicitacao.Indefinido,
                 motivo: "Objeto sem termos que classifiquem como válido ou inválido",
                 urlCompras: urlCompras, urlPncp: urlPncp));
             Log.Aviso("Objeto indefinido; nada será baixado (revisar a regra de palavras-chave).");
@@ -226,24 +251,24 @@ public sealed class ExecutadorFluxo
     }
 
     // ------------------------------------------------------------------
-    //  Fluxo via API oficial do PNCP (sem navegador, sem captcha)
+    //  Tarefa específica via API oficial do PNCP (sem navegador, sem captcha)
     // ------------------------------------------------------------------
 
     /// <summary>
     /// Mesmo resultado do fluxo do portal, pela API: para cada UASG lista as compras
-    /// recebendo propostas, aplica a regra do objeto, baixa todos os arquivos ativos
-    /// e envia os e-mails. Uma UASG que falhar na API não grava nada no histórico,
-    /// então é tentada de novo no próximo ciclo (nenhuma licitação se perde).
+    /// recebendo propostas, aplica a regra do objeto e baixa todos os arquivos ativos.
+    /// Uma UASG que falhar na API não grava nada no histórico, então é tentada de novo
+    /// no próximo ciclo (nenhuma licitação se perde). Devolve a quantidade de falhas.
     /// </summary>
-    public async Task<int> ExecutarViaApiAsync(PncpApiService api, IReadOnlyList<ClienteUasg> clientes,
+    public async Task<int> ProcessarUasgsViaApiAsync(PncpApiService api, IReadOnlyList<ClienteUasg> clientes,
         CancellationToken cancelamento = default)
     {
         _cancelamento = cancelamento;
-        int falhas = 0, processadas = 0;
+        int falhas = 0;
 
         foreach (ClienteUasg cliente in clientes)
         {
-            if (_cancelamento.IsCancellationRequested) break;
+            if (_cancelamento.IsCancellationRequested || LimiteAtingido()) break;
 
             Log.Secao($"CLIENTE: {cliente.Codigo} - {cliente.Orgao}");
             try
@@ -269,20 +294,25 @@ public sealed class ExecutadorFluxo
                         continue;
                     }
 
+                    if (PrazoEncerrado(lic))
+                    {
+                        Log.Info($"  Ignorada (prazo encerrado em {lic.Prazo}): {lic.Titulo}");
+                        continue;
+                    }
+
                     if (_historico.JaProcessada(lic.Chave))
                     {
                         Log.Info($"  Já processada anteriormente: {lic.Titulo}");
                         continue;
                     }
 
-                    if (_cfg.MaxLicitacoes.HasValue && processadas >= _cfg.MaxLicitacoes.Value)
+                    if (LimiteAtingido())
                     {
-                        Log.Aviso($"Limite de {_cfg.MaxLicitacoes.Value} licitação(ões) por ciclo atingido.");
+                        Log.Aviso($"Limite de {_cfg.MaxLicitacoes} licitação(ões) por ciclo atingido.");
                         break;
                     }
 
-                    await ProcessarLicitacaoApiAsync(api, cliente, lic);
-                    processadas++;
+                    await ProcessarLicitacaoApiAsync(api, lic, Contexto.DeCliente(cliente, lic.Plataforma));
                 }
             }
             catch (OperationCanceledException) when (_cancelamento.IsCancellationRequested)
@@ -296,24 +326,124 @@ public sealed class ExecutadorFluxo
             }
         }
 
-        falhas += await EnviarEmailsAsync();
-        return falhas == 0 ? 0 : 1;
+        return falhas;
     }
 
-    private async Task ProcessarLicitacaoApiAsync(PncpApiService api, ClienteUasg cliente, LicitacaoPncp lic)
+    // ------------------------------------------------------------------
+    //  Tarefa geral: UF + fontes/plataformas (filtros do site do PNCP)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Busca geral: licitações a receber/recebendo propostas nas UFs e fontes/plataformas
+    /// de <see cref="Configuracao"/>, com as MESMAS regras da tarefa por UASG: só as
+    /// "Divulgada no PNCP" com prazo em aberto, regra do objeto, download e e-mail.
+    /// O que a tarefa por UASG já avaliou (neste ciclo ou antes) não é repetido.
+    /// Se a busca falhar, nada é gravado no histórico e ela é repetida no próximo ciclo.
+    /// Devolve a quantidade de falhas.
+    /// </summary>
+    public async Task<int> ProcessarBuscaGeralAsync(PncpApiService api, CancellationToken cancelamento = default)
     {
+        _cancelamento = cancelamento;
+        Log.Secao($"TAREFA GERAL - UF: {string.Join(", ", Configuracao.UfsBuscaGeral)} | " +
+                  $"Fontes/Plataformas: {string.Join(" e ", Configuracao.PlataformasBuscaGeral.Values)}");
+
+        List<LicitacaoPncp> encontradas;
+        try
+        {
+            encontradas = await api.ListarBuscaGeralAsync(Configuracao.UfsBuscaGeral,
+                Configuracao.PlataformasBuscaGeral.Keys.ToList(), _cancelamento);
+        }
+        catch (OperationCanceledException) when (_cancelamento.IsCancellationRequested)
+        {
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Log.Erro($"Falha na busca geral: {ex.Message} (será tentada no próximo ciclo)");
+            return 1;
+        }
+
+        Log.Info($"Busca geral: {encontradas.Count} licitação(ões) a receber/recebendo propostas.");
+
+        int ignoradas = 0, jaProcessadas = 0, avaliadas = 0;
+        try
+        {
+            foreach (LicitacaoPncp lic in encontradas.OrderBy(l => l.EncerramentoProposta))
+            {
+                if (_cancelamento.IsCancellationRequested) break;
+
+                if (lic.SituacaoId != 1)
+                {
+                    ignoradas++;
+                    Log.Info($"  Ignorada ({lic.SituacaoNome}): {lic.Titulo} - {lic.UnidadeNome}");
+                    continue;
+                }
+
+                if (PrazoEncerrado(lic))
+                {
+                    ignoradas++;
+                    Log.Info($"  Ignorada (prazo encerrado em {lic.Prazo}): {lic.Titulo} - {lic.UnidadeNome}");
+                    continue;
+                }
+
+                // Avaliada há pouco pela tarefa por UASG ou já processada em ciclos anteriores.
+                if (_avaliadasNoCiclo.Contains(lic.Chave) || _avaliadasPortalNoCiclo.Contains(lic.ChaveLegada) ||
+                    _historico.JaProcessada(lic.Chave))
+                {
+                    jaProcessadas++;
+                    continue;
+                }
+
+                if (LimiteAtingido())
+                {
+                    Log.Aviso($"Limite de {_cfg.MaxLicitacoes} licitação(ões) por ciclo atingido.");
+                    break;
+                }
+
+                avaliadas++;
+                await ProcessarLicitacaoApiAsync(api, lic,
+                    new Contexto(lic.Uasg, lic.UnidadeNome, OrigemLicitacao.Geral, lic.Plataforma));
+            }
+        }
+        catch (OperationCanceledException) when (_cancelamento.IsCancellationRequested)
+        {
+            // Ctrl+C: a licitação em andamento não foi gravada e volta no próximo ciclo.
+        }
+
+        Log.Info($"Busca geral concluída: {encontradas.Count} encontrada(s), {jaProcessadas} já processada(s), " +
+                 $"{ignoradas} ignorada(s), {avaliadas} avaliada(s) agora.");
+        return 0;
+    }
+
+    private static bool PrazoEncerrado(LicitacaoPncp lic) =>
+        lic.EncerramentoProposta is DateTime fim && fim <= DateTime.Now;
+
+    private static string SemZeros(string codigo)
+    {
+        string s = codigo.Trim().TrimStart('0');
+        return s.Length == 0 ? "0" : s;
+    }
+
+    private bool LimiteAtingido() =>
+        _cfg.MaxLicitacoes.HasValue && _processadasNoCiclo >= _cfg.MaxLicitacoes.Value;
+
+    private async Task ProcessarLicitacaoApiAsync(PncpApiService api, LicitacaoPncp lic, Contexto ctx)
+    {
+        _processadasNoCiclo++;
+        _avaliadasNoCiclo.Add(lic.Chave);
+
         LicitacaoEncontrada alvo = lic.ParaEncontrada();
-        Log.Secao($"LICITAÇÃO {alvo.Titulo} (UASG {cliente.Codigo}) - prazo {alvo.Prazo}");
+        Log.Secao($"LICITAÇÃO {alvo.Titulo} ({ctx.Descricao}) - prazo {alvo.Prazo}");
         Log.Info($"Objeto: {alvo.Objeto}");
 
-        if (!ObjetoAprovado(cliente, alvo, lic.UrlCompras, lic.UrlPncp)) return;
+        if (!ObjetoAprovado(ctx, alvo, lic.UrlCompras, lic.UrlPncp)) return;
 
         try
         {
             List<ArquivoPncp> arquivos = await api.ListarArquivosAsync(lic, _cancelamento);
             if (arquivos.Count == 0)
             {
-                _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.SemEdital,
+                _historico.Salvar(NovoRegistro(ctx, alvo, StatusLicitacao.SemEdital,
                     motivo: "Nenhum arquivo publicado no PNCP",
                     urlCompras: lic.UrlCompras, urlPncp: lic.UrlPncp));
                 Log.Aviso("PNCP sem arquivos publicados; seguindo para a próxima licitação.");
@@ -324,13 +454,14 @@ public sealed class ExecutadorFluxo
             foreach (ArquivoPncp arquivo in arquivos)
                 caminhos.Add(await _download.BaixarAsync(arquivo.Url, alvo.Numero, arquivo.Nome));
 
-            _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.Baixado,
+            LicitacaoHistorico registro = NovoRegistro(ctx, alvo, StatusLicitacao.Baixado,
                 urlCompras: lic.UrlCompras, urlPncp: lic.UrlPncp,
                 arquivo: string.Join("\n", caminhos),
-                emailEnviado: false));
+                emailEnviado: false);
+            _historico.Salvar(registro);
 
             Log.Ok($"{caminhos.Count} arquivo(s) salvo(s) na pasta de saída.");
-            _paraEmail.Add(new ItemEmail(alvo.Chave, cliente.Codigo, alvo.Titulo, alvo.Objeto, caminhos));
+            _paraEmail.Add(ItemEmail.DeRegistro(registro, caminhos));
         }
         catch (OperationCanceledException) when (_cancelamento.IsCancellationRequested)
         {
@@ -339,26 +470,31 @@ public sealed class ExecutadorFluxo
         catch (Exception ex)
         {
             Log.Erro($"Erro ao processar {alvo.Titulo}: {ex.Message}");
-            _historico.Salvar(NovoRegistro(cliente, alvo, StatusLicitacao.Erro,
+            _historico.Salvar(NovoRegistro(ctx, alvo, StatusLicitacao.Erro,
                 motivo: ex.Message, urlCompras: lic.UrlCompras, urlPncp: lic.UrlPncp));
         }
     }
 
+    // ------------------------------------------------------------------
+    //  E-mails (fim do ciclo, depois das duas tarefas)
+    // ------------------------------------------------------------------
+
     /// <summary>
-    /// Fase final de e-mail: junta os downloads desta execução com as pendências
-    /// de execuções anteriores, divide em lotes de 2 a 4 licitações (1 → lote
-    /// único) e envia cada lote com corpo (UASG/número/objeto) e anexos
+    /// Fase final de e-mail: junta os downloads desta execução (das duas tarefas) com
+    /// as pendências de execuções anteriores, divide em lotes de 2 a 4 licitações
+    /// (1 → lote único) e envia cada lote com corpo (UASG/número/objeto) e anexos
     /// (1 arquivo direto; 2 ou mais embalados em .zip).
     /// Falha de envio mantém as licitações PENDENTES para a próxima execução.
+    /// Devolve a quantidade de falhas.
     /// </summary>
-    private async Task<int> EnviarEmailsAsync()
+    public async Task<int> EnviarEmailsAsync()
     {
         var itens = new List<ItemEmail>(_paraEmail);
 
         // Pendências de execuções anteriores (download ok, e-mail ainda não saiu).
         foreach (LicitacaoHistorico reg in _historico.PendentesDeEmail())
         {
-            if (itens.Any(i => i.Chave == reg.Chave)) continue;
+            if (itens.Any(i => string.Equals(i.Chave, reg.Chave, StringComparison.OrdinalIgnoreCase))) continue;
 
             string[] arquivos = reg.Arquivo
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -371,7 +507,7 @@ public sealed class ExecutadorFluxo
                 continue;
             }
 
-            itens.Add(new ItemEmail(reg.Chave, reg.Uasg, reg.Titulo, reg.Objeto, arquivos));
+            itens.Add(ItemEmail.DeRegistro(reg, arquivos));
         }
 
         if (itens.Count == 0)
@@ -416,7 +552,7 @@ public sealed class ExecutadorFluxo
                     }
                     else
                     {
-                        string zip = EmailService.CriarZip(item.Arquivos, item.Chave);
+                        string zip = EmailService.CriarZip(item.Arquivos, item.NomeAnexo);
                         anexos.Add(zip);
                         zips.Add(zip);
                     }
@@ -452,7 +588,7 @@ public sealed class ExecutadorFluxo
         }
 
         Log.Info($"E-mails: {enviados} enviado(s), {falhas} falha(s).");
-        return falhas == 0 ? 0 : 1;
+        return falhas;
     }
 
     /// <summary>Log de rede/console para diagnosticar falhas da automação.
@@ -542,7 +678,7 @@ public sealed class ExecutadorFluxo
         string.IsNullOrEmpty(texto) ? "" : texto.Length <= max ? texto : texto[..max] + "...";
 
     private static LicitacaoHistorico NovoRegistro(
-        ClienteUasg cliente,
+        Contexto ctx,
         LicitacaoEncontrada alvo,
         string status,
         string motivo = "",
@@ -552,8 +688,10 @@ public sealed class ExecutadorFluxo
         bool? emailEnviado = null) => new()
     {
         Chave = alvo.Chave,
-        Uasg = cliente.Codigo,
-        UasgNome = cliente.Orgao,
+        Uasg = ctx.Uasg,
+        UasgNome = ctx.UasgNome,
+        Origem = ctx.Origem,
+        Plataforma = ctx.Plataforma,
         Titulo = alvo.Titulo,
         Numero = alvo.Numero,
         Objeto = alvo.Objeto,

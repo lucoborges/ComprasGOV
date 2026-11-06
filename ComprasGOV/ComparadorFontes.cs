@@ -55,8 +55,9 @@ public sealed class ComparadorFontes
                 if (cnpj is null) erroApi = "UASG não encontrada nos Dados Abertos";
                 else
                 {
+                    // O portal só conhece "UASG-número/ano": casa as duas fontes por esse formato.
                     api = (await _api.ListarPropostasAbertasAsync(cliente.Codigo, cnpj, ct))
-                        .GroupBy(l => l.Chave).ToDictionary(g => g.Key, g => g.First());
+                        .GroupBy(l => l.ChaveLegada).ToDictionary(g => g.Key, g => g.First());
                     Log.Info($"API: {api.Count} licitação(ões) em {relogio.Elapsed.TotalSeconds:F1}s.");
                 }
             }
@@ -150,7 +151,7 @@ public sealed class ComparadorFontes
                 }
 
                 string classif = $"{Descr(p?.Objeto)} / {Descr(a?.Objeto)}{obs}";
-                string hist = _historico.JaProcessada(chave) ? "sim" : "não";
+                string hist = _historico.JaProcessada(a?.Chave ?? chave) ? "sim" : "não";
                 detalhes.AppendLine($"| {p?.Titulo ?? a?.Titulo} | {(p is null ? "—" : "✔")} | {(a is null ? "—" : "✔")} | " +
                                     $"{a?.SituacaoNome ?? ""} | {p?.Prazo ?? ""} | {a?.Prazo ?? ""} | {classif} | {hist} |");
             }

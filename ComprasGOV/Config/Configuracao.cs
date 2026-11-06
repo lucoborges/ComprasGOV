@@ -50,6 +50,30 @@ public sealed class Configuracao
     /// <summary>Pausa entre ciclos no modo contínuo (padrão: 60 minutos).</summary>
     public int IntervaloMinutos { get; private set; } = 60;
 
+    // --- Tarefas do ciclo -------------------------------------------------------
+    /// <summary>Tarefa específica: UASGs da planilha de clientes (--so-busca-geral desativa).</summary>
+    public bool ExecutarTarefaUasg { get; private set; } = true;
+
+    /// <summary>
+    /// Tarefa geral, executada depois da de UASGs: licitações das <see cref="UfsBuscaGeral"/>
+    /// publicadas pelas <see cref="PlataformasBuscaGeral"/> (--sem-busca-geral desativa;
+    /// --uasg também, pois processa apenas a UASG informada).
+    /// </summary>
+    public bool ExecutarBuscaGeral { get; private set; } = true;
+
+    /// <summary>UFs da busca geral (filtro "UFs" do site do PNCP).</summary>
+    public static readonly IReadOnlyList<string> UfsBuscaGeral = new[] { "ES" };
+
+    /// <summary>
+    /// Fontes/Plataformas da busca geral (filtro "Fontes/Plataformas" do site do PNCP):
+    /// código do sistema que publica no PNCP -> nome exibido no site.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<int, string> PlataformasBuscaGeral = new Dictionary<int, string>
+    {
+        [3] = "Compras.gov.br",
+        [350] = "PORTAL GOV SERVICOS DIGITAIS LTDA / PORTAL GOV",
+    };
+
     /// <summary>Padrão: processa TODOS os clientes da planilha (item 1).</summary>
     public bool ProcessarTodosClientes { get; private set; } = true;
     public string? UasgManual { get; private set; }
@@ -184,6 +208,14 @@ public sealed class Configuracao
                     if (i + 1 < args.Length) cfg.UasgManual = args[++i].Trim();
                     break;
 
+                case "--sem-busca-geral":
+                    cfg.ExecutarBuscaGeral = false;
+                    break;
+
+                case "--so-busca-geral":
+                    cfg.ExecutarTarefaUasg = false;
+                    break;
+
                 case "--max":
                     if (i + 1 < args.Length && int.TryParse(args[++i], out int max)) cfg.MaxLicitacoes = max;
                     break;
@@ -206,18 +238,37 @@ public sealed class Configuracao
             }
         }
 
+        // --uasg processa apenas a UASG informada (sem a busca geral).
+        if (!string.IsNullOrWhiteSpace(cfg.UasgManual))
+        {
+            if (!cfg.ExecutarTarefaUasg)
+                Console.WriteLine("--uasg informado: --so-busca-geral ignorado (processa só a UASG, sem a busca geral).");
+            cfg.ExecutarTarefaUasg = true;
+            cfg.ExecutarBuscaGeral = false;
+        }
+
         return cfg;
     }
 
     public static void ExibirAjuda()
     {
-        Console.WriteLine("""
+        Console.WriteLine($"""
             ComprasGOV - automação Compras.gov.br -> PNCP (download de editais)
 
             Uso: ComprasGOV [opções]
 
+            Cada ciclo executa duas tarefas, nesta ordem:
+              1) específica: UASGs da planilha de clientes;
+              2) geral: licitações a receber/recebendo propostas no PNCP com os filtros
+                 UF = {string.Join(", ", UfsBuscaGeral)} e Fontes/Plataformas = {string.Join(" e ", PlataformasBuscaGeral.Values)}
+                 (mesmos filtros do site do PNCP).
+              Nas duas valem as mesmas regras (só divulgadas, prazo em aberto, regra do
+              objeto), o mesmo download e o mesmo e-mail; nada é processado duas vezes.
+
             Opções:
-              --uasg <codigo>           Processa apenas o código UASG informado (ex.: 90014).
+              --uasg <codigo>           Processa apenas o código UASG informado (ex.: 90014), sem a busca geral.
+              --sem-busca-geral         Executa só a tarefa de UASGs da planilha.
+              --so-busca-geral          Executa só a busca geral (UF + fontes/plataformas).
               --todos                   Sem efeito: o padrão já processa TODOS os clientes.
               --headless                Executa sem janela do navegador (padrão: janela visível).
               --fonte <api|portal>      Origem das licitações. api (padrão): API oficial do PNCP,
@@ -227,7 +278,7 @@ public sealed class Configuracao
                                         histórico) e salva um relatório; executa uma vez.
               --uma-vez                 Executa um único ciclo e encerra (padrão: contínuo 24/7).
               --intervalo <minutos>     Pausa entre ciclos no modo contínuo (padrão: 60).
-              --max <n>                 Limita a quantidade de licitações processadas por execução.
+              --max <n>                 Limita a quantidade de licitações processadas por ciclo (somando as tarefas).
               --planilha <caminho>      Caminho da planilha de órgãos (xlsx).
               --pasta-saida <caminho>   Pasta onde os arquivos serão salvos.
               --historico <arquivo>     Arquivo JSON de licitações já processadas.
