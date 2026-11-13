@@ -1,0 +1,54 @@
+name: Build e Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      simular_falha:
+        description: 'Somente teste: reprova a versão nova de propósito para exercitar o desfazer'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Roda em máquina do GitHub (não no servidor): compila em todo push e pull request
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Compilar
+        run: dotnet build ComprasGOV/ComprasGOV.csproj -c Release --nologo -p:TreatWarningsAsErrors=true
+
+  # Roda no servidor, só na main (push ou execução manual) e só se o build passar.
+  # Pull requests nunca chegam aqui.
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, comprasgov]
+    concurrency: deploy-producao
+    steps:
+      # O servidor é Windows Server 2012 R2: as ações do GitHub baseadas em Node.js (como
+      # actions/checkout) não rodam nele, então o código é baixado com git direto.
+      - name: Baixar o código, publicar, trocar e verificar
+        shell: powershell
+        run: |
+          $codigo = Join-Path $env:RUNNER_TEMP 'codigo'
+          if (Test-Path $codigo) { Remove-Item $codigo -Recurse -Force }
+          git init -q $codigo
+          git -C $codigo fetch -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ${{ github.sha }}
+          if ($LASTEXITCODE -ne 0) { throw 'Falha ao baixar o codigo. O robo nao foi alterado.' }
+          git -C $codigo checkout -q FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Falha no checkout. O robo nao foi alterado.' }
+
+          $versao = "${{ github.sha }}".Substring(0, 7)
+          $simular = '${{ inputs.simular_falha }}' -eq 'true'
+          & (Join-Path $codigo 'deploy\deploy.ps1') -Versao $versao -SimularFalha:$simular
+          exit $LASTEXITCODE

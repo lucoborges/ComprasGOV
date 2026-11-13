@@ -23,6 +23,10 @@ if (cfg.MostrarAjuda)
 
 Log.Secao("ComprasGOV - automação Compras.gov.br -> PNCP");
 
+// versao.txt é gravado pelo deploy (commit publicado); o deploy confere esta linha no log.
+string arquivoVersao = Path.Combine(AppContext.BaseDirectory, "versao.txt");
+Log.Info($"Versão: {(File.Exists(arquivoVersao) ? File.ReadAllText(arquivoVersao).Trim() : "desenvolvimento")}");
+
 if (cfg.InstalarNavegadores)
 {
     try
@@ -50,6 +54,35 @@ Console.CancelKeyPress += (_, e) =>
         cancelamento.Cancel();
     }
 };
+
+// Parada limpa sem console (tarefa agendada/deploy): quando o arquivo indicado em
+// COMPRASGOV_ARQUIVO_PARADA aparece, o efeito é o mesmo do Ctrl+C. O deploy cria o
+// arquivo, espera o processo sair e só mata à força se ele não sair a tempo.
+string? arquivoParada = Environment.GetEnvironmentVariable("COMPRASGOV_ARQUIVO_PARADA");
+if (!string.IsNullOrWhiteSpace(arquivoParada))
+{
+    try { File.Delete(arquivoParada); } catch { /* sinal antigo; será tentado de novo abaixo */ }
+
+    _ = Task.Run(async () =>
+    {
+        while (!cancelamento.IsCancellationRequested)
+        {
+            try
+            {
+                if (File.Exists(arquivoParada))
+                {
+                    try { File.Delete(arquivoParada); } catch { /* quem criou apaga */ }
+                    Log.Aviso("Sinal de parada recebido: encerrando após a etapa atual...");
+                    cancelamento.Cancel();
+                    return;
+                }
+                await Task.Delay(TimeSpan.FromSeconds(2), cancelamento.Token);
+            }
+            catch (OperationCanceledException) { return; }
+            catch { /* falha momentânea de disco: tenta de novo */ }
+        }
+    });
+}
 
 // Histórico (não reprocessa o que já foi avaliado) - fica no servidor e é
 // carregado no primeiro ciclo em que a pasta estiver acessível.
