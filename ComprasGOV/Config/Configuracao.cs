@@ -107,6 +107,14 @@ public sealed class Configuracao
     public const string SmtpHostPadrao = "smtp.email-ssl.com.br";
     public const int SmtpPortaPadrao = 587;
 
+    /// <summary>
+    /// Soma máxima dos anexos de uma mensagem. Em base64 o e-mail cresce ~37%, então
+    /// 20 MB de arquivos viram ~27 MB na rede, abaixo do limite usual dos provedores.
+    /// Acima disso o lote é dividido; uma licitação que sozinha passa do limite vai
+    /// sem anexo, com o caminho dos arquivos no corpo.
+    /// </summary>
+    public const int LimiteAnexosEmailMb = 20;
+
     /// <summary>Destinatário; pode ser sobrescrito com --email-destino.</summary>
     public string EmailDestino { get; private set; } = EmailDestinoPadrao;
 

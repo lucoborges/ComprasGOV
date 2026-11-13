@@ -44,7 +44,57 @@ public sealed class HistoricoService
     {
         _caminho = caminho;
         _somenteLeitura = somenteLeitura;
-        Carregar();
+
+        if (!somenteLeitura) _trava = AdquirirTrava();
+        try
+        {
+            Carregar();
+        }
+        catch
+        {
+            _trava?.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Trava de instância única: arquivo "&lt;histórico&gt;.lock" aberto com exclusividade de
+    /// escrita enquanto o processo vive (vale também entre máquinas, pela rede). Sem ela,
+    /// duas instâncias gravariam o mesmo JSON e a última apagaria os registros da outra.
+    /// O sistema operacional libera e apaga o arquivo quando o processo termina, mesmo
+    /// se for encerrado à força.
+    /// </summary>
+    private readonly FileStream? _trava;
+
+    private FileStream AdquirirTrava()
+    {
+        string arquivo = _caminho + ".lock";
+        try
+        {
+            var trava = new FileStream(arquivo, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read,
+                bufferSize: 4096, FileOptions.DeleteOnClose);
+            trava.SetLength(0);
+            trava.Write(System.Text.Encoding.UTF8.GetBytes(
+                $"{Environment.MachineName} (PID {Environment.ProcessId}) desde {DateTime.Now:dd/MM/yyyy HH:mm:ss}"));
+            trava.Flush();
+            return trava;
+        }
+        catch (IOException) when (File.Exists(arquivo))
+        {
+            string dono = "";
+            try
+            {
+                using var leitura = new FileStream(arquivo, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                using var leitor = new StreamReader(leitura);
+                dono = leitor.ReadToEnd().Trim();
+            }
+            catch { /* só informativo */ }
+
+            throw new InvalidOperationException(
+                $"Outra instância do ComprasGOV já está usando o histórico {_caminho}" +
+                (dono.Length > 0 ? $": {dono}" : ""));
+        }
     }
 
     private sealed class ArquivoHistorico

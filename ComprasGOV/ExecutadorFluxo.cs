@@ -180,10 +180,8 @@ public sealed class ExecutadorFluxo
                 return;
             }
 
-            // Baixa TODOS os arquivos do PNCP (não apenas o edital).
-            var caminhos = new List<string>();
-            foreach (ArquivoPncp arquivo in arquivos)
-                caminhos.Add(await _download.BaixarAsync(arquivo.Url, alvo.Numero, arquivo.Nome));
+            // Baixa TODOS os arquivos do PNCP (não apenas o edital), tudo ou nada.
+            List<string> caminhos = await _download.BaixarTodosAsync(arquivos, alvo.Numero, _cancelamento);
 
             LicitacaoHistorico registro = NovoRegistro(ctx, alvo, StatusLicitacao.Baixado,
                 urlCompras: page.Url, urlPncp: pncp.Url,
@@ -450,9 +448,8 @@ public sealed class ExecutadorFluxo
                 return;
             }
 
-            var caminhos = new List<string>();
-            foreach (ArquivoPncp arquivo in arquivos)
-                caminhos.Add(await _download.BaixarAsync(arquivo.Url, alvo.Numero, arquivo.Nome));
+            // Tudo ou nada: se um arquivo falhar, nada fica na pasta de saída.
+            List<string> caminhos = await _download.BaixarTodosAsync(arquivos, alvo.Numero, _cancelamento);
 
             LicitacaoHistorico registro = NovoRegistro(ctx, alvo, StatusLicitacao.Baixado,
                 urlCompras: lic.UrlCompras, urlPncp: lic.UrlPncp,
@@ -530,7 +527,23 @@ public sealed class ExecutadorFluxo
             return 1;
         }
 
-        var lotes = EmailService.SepararEmLotes(itens);
+        long limite = Configuracao.LimiteAnexosEmailMb * 1024L * 1024L;
+
+        // Licitação que sozinha passa do limite vai SEM anexo (o corpo aponta os arquivos
+        // na pasta de saída): com anexo o servidor recusaria a mensagem a cada ciclo.
+        var semAnexo = new HashSet<string>(
+            itens.Where(i => TamanhoArquivos(i) > limite).Select(i => i.Chave),
+            StringComparer.OrdinalIgnoreCase);
+        foreach (ItemEmail item in itens.Where(i => semAnexo.Contains(i.Chave)))
+            Log.Aviso($"{item.Numero}: {TamanhoArquivos(item) / 1024.0 / 1024.0:F1} MB em arquivos, acima do limite de " +
+                      $"{Configuracao.LimiteAnexosEmailMb} MB por e-mail; vai sem anexo.");
+
+        // Lotes de 2 a 4 licitações; um lote que passar do limite é dividido em mensagens menores.
+        var lotes = EmailService.SepararEmLotes(itens)
+            .SelectMany(lote => EmailService.DividirPorTamanho(lote,
+                i => semAnexo.Contains(i.Chave) ? 0 : TamanhoArquivos(i), limite))
+            .ToList();
+
         Log.Secao($"ENVIANDO E-MAILS: {itens.Count} licitação(ões) em " +
                   $"{lotes.Count} mensagem(ns) para {_cfg.EmailDestino}");
 
@@ -538,36 +551,24 @@ public sealed class ExecutadorFluxo
 
         foreach (var lote in lotes)
         {
-            var anexos = new List<string>();
-            var zips = new List<string>();
-
             try
             {
-                foreach (ItemEmail item in lote)
+                try
                 {
-                    // 1 arquivo → anexo direto; 2 ou mais → embala em .zip.
-                    if (item.Arquivos.Count == 1)
-                    {
-                        anexos.Add(item.Arquivos[0]);
-                    }
-                    else
-                    {
-                        string zip = EmailService.CriarZip(item.Arquivos, item.NomeAnexo);
-                        anexos.Add(zip);
-                        zips.Add(zip);
-                    }
+                    await EnviarLoteAsync(lote, semAnexo);
+                }
+                catch (System.Net.Mail.SmtpException ex)
+                    when (EmailService.RecusadoPeloTamanho(ex) && lote.Any(i => !semAnexo.Contains(i.Chave)))
+                {
+                    // O limite real do servidor é menor que o configurado: reenvia sem anexos
+                    // em vez de deixar o lote falhando a cada ciclo.
+                    Log.Aviso($"Servidor recusou a mensagem pelo tamanho ({ex.GetBaseException().Message}); " +
+                              "reenviando sem anexos.");
+                    await EnviarLoteAsync(lote,
+                        new HashSet<string>(lote.Select(i => i.Chave), StringComparer.OrdinalIgnoreCase));
                 }
 
-                string assunto = $"Licitações Compras.gov.br - {DateTime.Now:dd/MM/yyyy}";
-                await _email.EnviarAsync(assunto, EmailService.MontarCorpo(lote), anexos);
-
-                foreach (ItemEmail item in lote)
-                    _historico.MarcarEmailEnviado(item.Chave);
-
                 enviados++;
-                long bytes = anexos.Sum(a => new FileInfo(a).Length);
-                Log.Ok($"E-mail enviado para {_cfg.EmailDestino}: {lote.Count} licitação(ões), " +
-                       $"{anexos.Count} anexo(s), {bytes / 1024.0 / 1024.0:F1} MB.");
             }
             catch (Exception ex)
             {
@@ -578,18 +579,62 @@ public sealed class ExecutadorFluxo
                 if (raiz != ex) Log.Aviso($"Detalhe: {ex.Message}");
                 Log.Aviso("Elas ficam PENDENTES e serão reenviadas na próxima execução.");
             }
-            finally
-            {
-                foreach (string zip in zips)
-                {
-                    try { File.Delete(zip); } catch { /* temporário */ }
-                }
-            }
         }
 
         Log.Info($"E-mails: {enviados} enviado(s), {falhas} falha(s).");
         return falhas;
     }
+
+    /// <summary>
+    /// Envia um lote e marca as licitações como e-mailadas. As chaves em
+    /// <paramref name="semAnexo"/> vão só no corpo, com o caminho dos arquivos.
+    /// </summary>
+    private async Task EnviarLoteAsync(IReadOnlyList<ItemEmail> lote, IReadOnlySet<string> semAnexo)
+    {
+        var anexos = new List<string>();
+        var zips = new List<string>();
+
+        try
+        {
+            foreach (ItemEmail item in lote)
+            {
+                if (semAnexo.Contains(item.Chave)) continue;
+
+                // 1 arquivo → anexo direto; 2 ou mais → embala em .zip.
+                if (item.Arquivos.Count == 1)
+                {
+                    anexos.Add(item.Arquivos[0]);
+                }
+                else
+                {
+                    string zip = EmailService.CriarZip(item.Arquivos, item.NomeAnexo);
+                    anexos.Add(zip);
+                    zips.Add(zip);
+                }
+            }
+
+            string assunto = $"Licitações Compras.gov.br - {DateTime.Now:dd/MM/yyyy}";
+            await _email.EnviarAsync(assunto, EmailService.MontarCorpo(lote, semAnexo), anexos);
+
+            foreach (ItemEmail item in lote)
+                _historico.MarcarEmailEnviado(item.Chave);
+
+            long bytes = anexos.Sum(a => new FileInfo(a).Length);
+            Log.Ok($"E-mail enviado para {_cfg.EmailDestino}: {lote.Count} licitação(ões), " +
+                   $"{anexos.Count} anexo(s), {bytes / 1024.0 / 1024.0:F1} MB.");
+        }
+        finally
+        {
+            foreach (string zip in zips)
+            {
+                try { File.Delete(zip); } catch { /* temporário */ }
+            }
+        }
+    }
+
+    /// <summary>Soma dos arquivos da licitação (o .zip de PDFs fica praticamente do mesmo tamanho).</summary>
+    private static long TamanhoArquivos(ItemEmail item) =>
+        item.Arquivos.Sum(a => File.Exists(a) ? new FileInfo(a).Length : 0);
 
     /// <summary>Log de rede/console para diagnosticar falhas da automação.
     /// O detalhamento (REQ/HTTP/corpo/console) só acontece com --debug.</summary>

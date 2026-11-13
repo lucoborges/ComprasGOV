@@ -81,8 +81,49 @@ public sealed class EmailService
         return lotes;
     }
 
-    /// <summary>Corpo do e-mail: apenas UASG, número e objeto de cada licitação.</summary>
-    public static string MontarCorpo(IReadOnlyList<ItemEmail> itens)
+    /// <summary>
+    /// Divide um lote em mensagens cuja soma de anexos não passe de <paramref name="limiteBytes"/>
+    /// (mantém a ordem; um item que sozinho passa do limite fica em uma mensagem só dele).
+    /// </summary>
+    public static List<List<T>> DividirPorTamanho<T>(IReadOnlyList<T> lote, Func<T, long> tamanho, long limiteBytes)
+    {
+        var partes = new List<List<T>>();
+        var atual = new List<T>();
+        long soma = 0;
+
+        foreach (T item in lote)
+        {
+            long bytes = tamanho(item);
+            if (atual.Count > 0 && soma + bytes > limiteBytes)
+            {
+                partes.Add(atual);
+                atual = new List<T>();
+                soma = 0;
+            }
+            atual.Add(item);
+            soma += bytes;
+        }
+
+        if (atual.Count > 0) partes.Add(atual);
+        return partes;
+    }
+
+    /// <summary>O servidor SMTP recusou a mensagem por causa do tamanho (552 / 5.3.4).</summary>
+    public static bool RecusadoPeloTamanho(SmtpException ex)
+    {
+        if (ex.StatusCode == SmtpStatusCode.ExceededStorageAllocation) return true;
+
+        string texto = $"{ex.Message} {ex.GetBaseException().Message}";
+        return texto.Contains("5.3.4", StringComparison.Ordinal) ||
+               texto.Contains("message size", StringComparison.OrdinalIgnoreCase) ||
+               texto.Contains("size limit", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Corpo do e-mail: UASG, número e objeto de cada licitação. Para as chaves em
+    /// <paramref name="semAnexo"/> (arquivos grandes demais), lista onde os arquivos estão.
+    /// </summary>
+    public static string MontarCorpo(IReadOnlyList<ItemEmail> itens, IReadOnlySet<string>? semAnexo = null)
     {
         var sb = new StringBuilder();
         for (int i = 0; i < itens.Count; i++)
@@ -93,6 +134,13 @@ public sealed class EmailService
             sb.AppendLine($"UASG: {itens[i].Uasg}");
             sb.AppendLine($"Número: {itens[i].Numero}");
             sb.AppendLine($"Objeto: {itens[i].Objeto}");
+
+            if (semAnexo?.Contains(itens[i].Chave) == true)
+            {
+                sb.AppendLine("Arquivos grandes demais para anexar; estão na pasta:");
+                foreach (string arquivo in itens[i].Arquivos)
+                    sb.AppendLine($"  {arquivo}");
+            }
         }
         return sb.ToString();
     }

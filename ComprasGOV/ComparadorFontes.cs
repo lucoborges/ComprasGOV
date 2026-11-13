@@ -38,7 +38,7 @@ public sealed class ComparadorFontes
         // Histórico vazio e descartável: no portal, ColetarAlvosAsync pula o que
         // já foi processado - aqui queremos TODAS as licitações em aberto.
         var semHistorico = new HistoricoService(Path.Combine(Path.GetTempPath(), "ComprasGOV",
-            $"comparacao_{Guid.NewGuid():N}.json"));
+            $"comparacao_{Guid.NewGuid():N}.json"), somenteLeitura: true);
 
         foreach (ClienteUasg cliente in clientes)
         {
