@@ -216,6 +216,8 @@ if (-not (Get-ScheduledTask -TaskName $NomeTarefa -ErrorAction SilentlyContinue)
     # COMPRASGOV_* do usuario e as pastas de rede do proprio servidor.
     $acao = New-ScheduledTaskAction -Execute $lancador -WorkingDirectory $app
     $gatilho = New-ScheduledTaskTrigger -AtStartup
+    # 2 min apos o boot: da tempo da rede e do compartilhamento do banco subirem
+    $gatilho.Delay = 'PT2M'
     $conta = New-ScheduledTaskPrincipal -UserId 'Administrator' -LogonType S4U -RunLevel Highest
     $opcoes = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 `
         -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew `

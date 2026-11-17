@@ -16,16 +16,19 @@ permissions:
   contents: read
 
 jobs:
-  # Roda em máquina do GitHub (não no servidor): compila em todo push e pull request
+  # Roda em máquina do GitHub (não no servidor): compila e testa em todo push e pull request.
+  # Windows, como o servidor (trava de arquivo, caminhos e codificação iguais aos de produção).
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
       - name: Compilar
         run: dotnet build ComprasGOV/ComprasGOV.csproj -c Release --nologo -p:TreatWarningsAsErrors=true
+      - name: Testar
+        run: dotnet test ComprasGOV.Tests/ComprasGOV.Tests.csproj -c Release --nologo -p:TreatWarningsAsErrors=true
 
   # Roda no servidor, só na main (push ou execução manual) e só se o build passar.
   # Pull requests nunca chegam aqui.

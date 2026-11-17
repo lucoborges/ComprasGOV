@@ -10,7 +10,7 @@ namespace ComprasGOV.Services;
 /// Histórico de licitações já avaliadas, persistido em JSON local.
 /// Evita reextrair licitações que já foram baixadas (ou reavaliadas).
 /// </summary>
-public sealed class HistoricoService
+public sealed class HistoricoService : IDisposable
 {
     private static readonly JsonSerializerOptions Opcoes = new()
     {
@@ -101,6 +101,15 @@ public sealed class HistoricoService
     {
         public int Versao { get; set; }
         public List<LicitacaoHistorico>? Itens { get; set; }
+    }
+
+    /// <summary>
+    /// Libera a trava de instância única. Em produção a trava dura até o processo sair
+    /// (o sistema a libera mesmo em encerramento à força); usado pelos testes.
+    /// </summary>
+    public void Dispose()
+    {
+        lock (_lock) _trava?.Dispose();
     }
 
     /// <summary>Quantidade de registros no histórico.</summary>
