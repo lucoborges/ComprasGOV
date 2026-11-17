@@ -1,5 +1,4 @@
 using System.Text.RegularExpressions;
-using ComprasGOV.Config;
 using ComprasGOV.Models;
 using ComprasGOV.Services;
 using Microsoft.Playwright;
@@ -12,12 +11,17 @@ namespace ComprasGOV.Automation;
 /// </summary>
 public sealed class ComprasNetAutomacao
 {
+    private readonly string _urlPesquisa;
+
+    /// <param name="urlPesquisa">Tela pública de pesquisa de compras (Apis.PortalPesquisa).</param>
+    public ComprasNetAutomacao(string urlPesquisa) => _urlPesquisa = urlPesquisa;
+
     /// <summary>Abre a pesquisa e consulta as compras da unidade compradora informada.</summary>
     public async Task PesquisarAsync(IPage page, ClienteUasg cliente)
     {
         Log.Info($"Pesquisando compras da UASG {cliente.Codigo} ({cliente.Orgao})...");
 
-        await page.GotoAsync(Configuracao.UrlPesquisa, new PageGotoOptions
+        await page.GotoAsync(_urlPesquisa, new PageGotoOptions
         {
             WaitUntil = WaitUntilState.DOMContentLoaded,
             Timeout = 60_000

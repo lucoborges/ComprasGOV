@@ -22,10 +22,6 @@ namespace ComprasGOV.Services;
 /// </summary>
 public sealed class PncpApiService
 {
-    private const string UrlUasg = "https://dadosabertos.compras.gov.br/modulo-uasg/1_consultarUasg";
-    private const string UrlPropostas = "https://pncp.gov.br/api/consulta/v1/contratacoes/proposta";
-    private const string UrlArquivos = "https://pncp.gov.br/api/pncp/v1/orgaos/{0}/compras/{1}/{2}/arquivos";
-    private const string UrlBusca = "https://pncp.gov.br/api/search/";
     private const int TamanhoPagina = 50;
 
     /// <summary>Página grande: a busca do site costuma caber em uma única requisição.</summary>
@@ -46,12 +42,23 @@ public sealed class PncpApiService
         TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(60)
     };
 
+    // Endereços das APIs (seção "Apis" do arquivo de configuração).
+    private readonly string UrlUasg;
+    private readonly string UrlPropostas;
+    private readonly string UrlArquivos;
+    private readonly string UrlBusca;
+
     private readonly HttpClient _http;
     private readonly string _arquivoCacheCnpj;
     private readonly Dictionary<string, string> _cacheCnpj;
 
-    public PncpApiService(string arquivoCacheCnpj)
+    public PncpApiService(Config.Configuracao cfg)
     {
+        UrlUasg = cfg.UrlUasg;
+        UrlPropostas = cfg.UrlPropostas;
+        UrlArquivos = cfg.UrlArquivos;
+        UrlBusca = cfg.UrlBusca;
+        string arquivoCacheCnpj = cfg.ArquivoCacheCnpj;
         _arquivoCacheCnpj = arquivoCacheCnpj;
         _cacheCnpj = CarregarCache();
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(90) };

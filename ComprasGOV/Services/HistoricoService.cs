@@ -103,6 +103,12 @@ public sealed class HistoricoService
         public List<LicitacaoHistorico>? Itens { get; set; }
     }
 
+    /// <summary>Quantidade de registros no histórico.</summary>
+    public int Quantidade
+    {
+        get { lock (_lock) return _itens.Count; }
+    }
+
     /// <summary>
     /// Considera terminais apenas os status que não devem ser reprocessados.
     /// "erro" e "sem-edital" são tentados de novo a cada ciclo: o órgão costuma

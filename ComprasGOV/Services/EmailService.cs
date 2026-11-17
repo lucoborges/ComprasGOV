@@ -180,14 +180,14 @@ public sealed class EmailService
 
         using var mensagem = new MailMessage
         {
-            From = new MailAddress(Config.Configuracao.EmailRemetentePadrao),
+            From = new MailAddress(_cfg.EmailRemetente ?? throw new InvalidOperationException("Remetente não configurado.")),
             Subject = assunto,
             SubjectEncoding = Encoding.UTF8,
             Body = corpo,
             BodyEncoding = Encoding.UTF8,
             IsBodyHtml = false,
         };
-        mensagem.To.Add(_cfg.EmailDestino);
+        mensagem.To.Add(_cfg.EmailDestino ?? throw new InvalidOperationException("Destinatário não configurado."));
 
         foreach (string anexo in anexos)
         {
@@ -196,10 +196,10 @@ public sealed class EmailService
             mensagem.Attachments.Add(new Attachment(anexo));
         }
 
-        using var smtp = new SmtpClient(Config.Configuracao.SmtpHostPadrao, Config.Configuracao.SmtpPortaPadrao)
+        using var smtp = new SmtpClient(_cfg.SmtpHost, _cfg.SmtpPorta)
         {
             EnableSsl = true,
-            Credentials = new NetworkCredential(Config.Configuracao.EmailRemetentePadrao, senha),
+            Credentials = new NetworkCredential(_cfg.EmailRemetente, senha),
             Timeout = 180_000,
             DeliveryMethod = SmtpDeliveryMethod.Network,
         };

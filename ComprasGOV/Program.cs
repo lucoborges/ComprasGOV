@@ -17,15 +17,50 @@ Configuracao cfg = Configuracao.Ler(args);
 
 if (cfg.MostrarAjuda)
 {
-    Configuracao.ExibirAjuda();
-    return 0;
+    cfg.ExibirAjuda();
+    return cfg.Erros.Count == 0 ? 0 : 1;
 }
+
+// --validar-config: usado pelo deploy antes de parar o robô. Não exibe valores
+// (e-mails/caminhos), porque a saída vai para o log público do GitHub Actions.
+if (cfg.ValidarConfig)
+{
+    cfg.ValidarParaCiclo();
+    Console.WriteLine("Arquivo de configuração: " + (cfg.ArquivoConfig ?? "(nenhum)"));
+    foreach (string aviso in cfg.Avisos) Console.WriteLine("AVISO: " + aviso);
+    foreach (string erro in cfg.Erros) Console.WriteLine("ERRO: " + erro);
+    Console.WriteLine(cfg.Erros.Count == 0 ? "Configuração válida." : "Configuração INVÁLIDA.");
+    return cfg.Erros.Count == 0 ? 0 : 1;
+}
+
+// --saude: só lê o arquivo de estado (heartbeat); não grava log nem estado.
+if (cfg.VerificarSaude)
+    return Saude.Verificar(cfg.ArquivoEstado);
+
+// Log em arquivo com rotação; a senha SMTP nunca é gravada, mesmo se aparecer numa mensagem.
+Log.Ocultar(cfg.SmtpSenha);
+Log.Configurar(cfg.PastaLogs, cfg.LogTamanhoMaximoMb, cfg.LogRetencaoDias, cfg.LogTamanhoTotalMaximoMb, cfg.LogConsole);
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+    Log.Erro($"Erro inesperado, o programa vai encerrar: {e.ExceptionObject}");
 
 Log.Secao("ComprasGOV - automação Compras.gov.br -> PNCP");
 
-// versao.txt é gravado pelo deploy (commit publicado); o deploy confere esta linha no log.
+// versao.txt é gravado pelo deploy (commit publicado); vai para o log e para o estado.json.
 string arquivoVersao = Path.Combine(AppContext.BaseDirectory, "versao.txt");
-Log.Info($"Versão: {(File.Exists(arquivoVersao) ? File.ReadAllText(arquivoVersao).Trim() : "desenvolvimento")}");
+string versao = File.Exists(arquivoVersao) ? File.ReadAllText(arquivoVersao).Trim() : "desenvolvimento";
+Log.Info($"Versão: {versao}");
+Log.Info("Configuração: " + (cfg.ArquivoConfig ?? "nenhum arquivo (padrões do código + variáveis + argumentos)"));
+Log.Info($"Log em arquivo: {Log.ArquivoAtual ?? "(indisponível; só console)"}");
+foreach (string aviso in cfg.Avisos) Log.Aviso(aviso);
+
+if (!cfg.InstalarNavegadores) cfg.ValidarParaCiclo();
+if (cfg.Erros.Count > 0)
+{
+    foreach (string erro in cfg.Erros) Log.Erro(erro);
+    Log.Erro("Execução cancelada: corrija a configuração.");
+    Log.Encerrar();
+    return 1;
+}
 
 if (cfg.InstalarNavegadores)
 {
@@ -88,10 +123,11 @@ if (!string.IsNullOrWhiteSpace(arquivoParada))
 // carregado no primeiro ciclo em que a pasta estiver acessível.
 HistoricoService historico = null!;
 bool historicoCarregado = false;
+bool cicloAdiado = false;
 
 // API oficial do PNCP (sem navegador/captcha) - usada pela fonte "api", pela busca
 // geral e pela comparação.
-var api = new PncpApiService(cfg.ArquivoCacheCnpj);
+var api = new PncpApiService(cfg);
 
 // --testar-pncp e --comparar são modos de teste/diagnóstico de execução única.
 bool modoEspecial = cfg.Comparar || !string.IsNullOrWhiteSpace(cfg.TestarPncpUrl);
@@ -114,14 +150,19 @@ else if (!modoEspecial)
             : "API oficial do PNCP (sem navegador e sem captcha)."));
 
     if (cfg.ExecutarBuscaGeral)
-        Log.Info($"Tarefa geral (depois da específica): UF {string.Join(", ", Configuracao.UfsBuscaGeral)}; " +
-                 $"fontes/plataformas {string.Join(" e ", Configuracao.PlataformasBuscaGeral.Values)}.");
+        Log.Info($"Tarefa geral (depois da específica): UF {string.Join(", ", cfg.UfsBuscaGeral)}; " +
+                 $"fontes/plataformas {string.Join(" e ", cfg.PlataformasBuscaGeral.Values)}.");
 }
 
 bool continuo = cfg.Continuo && !modoEspecial;
 if (continuo)
     Log.Info($"Modo contínuo (24/7): pausa de {cfg.IntervaloMinutos} min entre ciclos. " +
              "Use --uma-vez para um único ciclo; Ctrl+C para encerrar.");
+
+// Heartbeat (rota de saúde): estado.json gravado agora, a cada etapa e a cada minuto.
+// O deploy e o "--saude" leem este arquivo.
+using var estado = new EstadoService(cfg.ArquivoEstado, versao, continuo, cfg.IntervaloMinutos, cfg.CicloMaximoMinutos);
+Log.Info($"Arquivo de estado (heartbeat): {estado.Arquivo}");
 
 int exitCode = 0;
 int ciclo = 0;
@@ -131,6 +172,14 @@ while (true)
     ciclo++;
     DateTime inicioCiclo = DateTime.Now;
     if (continuo) Log.Secao($"CICLO {ciclo} - início {inicioCiclo:dd/MM/yyyy HH:mm}");
+    cicloAdiado = false;
+    estado.Atualizar(e =>
+    {
+        e.Situacao = SituacaoRobo.EmCiclo;
+        e.Ciclo = ciclo;
+        e.InicioUltimoCiclo = inicioCiclo;
+        e.ProximoCiclo = null;
+    });
 
     exitCode = await ExecutarCicloAsync();
 
@@ -139,9 +188,19 @@ while (true)
     if (historicoCarregado) historico.ExibirEstatisticas();
     Log.Info(exitCode == 0 ? "Ciclo concluído sem falhas." : "Ciclo concluído com falhas (veja os erros acima).");
 
-    if (!continuo || cancelamento.IsCancellationRequested) break;
-
+    bool vaiContinuar = continuo && !cancelamento.IsCancellationRequested;
     DateTime proximo = DateTime.Now.AddMinutes(cfg.IntervaloMinutos);
+    estado.Atualizar(e =>
+    {
+        e.FimUltimoCiclo = DateTime.Now;
+        e.ResultadoUltimoCiclo = cicloAdiado ? "adiado" : exitCode == 0 ? "ok" : "falhas";
+        if (historicoCarregado) e.RegistrosHistorico = historico.Quantidade;
+        e.Situacao = !vaiContinuar ? SituacaoRobo.Encerrado : cicloAdiado ? SituacaoRobo.Adiado : SituacaoRobo.Inativo;
+        e.ProximoCiclo = vaiContinuar ? proximo : null;
+    });
+
+    if (!vaiContinuar) break;
+
     Log.Info($"Inativo por {cfg.IntervaloMinutos} min; próximo ciclo às {proximo:dd/MM/yyyy HH:mm}.");
     try
     {
@@ -153,7 +212,9 @@ while (true)
     }
 }
 
+estado.Atualizar(e => { e.Situacao = SituacaoRobo.Encerrado; e.ProximoCiclo = null; });
 Log.Info("ComprasGOV encerrado.");
+Log.Encerrar();
 return exitCode;
 
 // ---------------------------------------------------------------------------
@@ -293,6 +354,7 @@ bool CarregarHistorico()
             if (pasta.StartsWith(@"\\", StringComparison.Ordinal))
             {
                 Log.Erro($"Banco de dados inacessível: {pasta}. Ciclo adiado (nada foi processado).");
+                cicloAdiado = true;
                 return false;
             }
             Directory.CreateDirectory(pasta);
@@ -301,11 +363,17 @@ bool CarregarHistorico()
         // Nos modos de diagnóstico o histórico é só lido (nada é regravado no servidor).
         historico = new HistoricoService(cfg.ArquivoHistorico, somenteLeitura: modoEspecial);
         historicoCarregado = true;
+        estado.Atualizar(e =>
+        {
+            e.HistoricoCarregado = true;
+            e.RegistrosHistorico = historico.Quantidade;
+        });
         return true;
     }
     catch (Exception ex)
     {
         Log.Erro($"{ex.Message}. Ciclo adiado (nada foi processado).");
+        cicloAdiado = true;
         return false;
     }
 }

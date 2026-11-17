@@ -18,7 +18,7 @@ public sealed class ExecutadorFluxo
 {
     private readonly Configuracao _cfg;
     private readonly HistoricoService _historico;
-    private readonly ComprasNetAutomacao _compras = new();
+    private readonly ComprasNetAutomacao _compras;
     private readonly PncpAutomacao _pncp = new();
     private readonly DownloadEditalService _download;
     private readonly EmailService _email;
@@ -53,6 +53,7 @@ public sealed class ExecutadorFluxo
         _historico = historico;
         _download = new DownloadEditalService(cfg.PastaSaida);
         _email = new EmailService(cfg);
+        _compras = new ComprasNetAutomacao(cfg.UrlPesquisa);
     }
 
     // ------------------------------------------------------------------
@@ -342,14 +343,14 @@ public sealed class ExecutadorFluxo
     public async Task<int> ProcessarBuscaGeralAsync(PncpApiService api, CancellationToken cancelamento = default)
     {
         _cancelamento = cancelamento;
-        Log.Secao($"TAREFA GERAL - UF: {string.Join(", ", Configuracao.UfsBuscaGeral)} | " +
-                  $"Fontes/Plataformas: {string.Join(" e ", Configuracao.PlataformasBuscaGeral.Values)}");
+        Log.Secao($"TAREFA GERAL - UF: {string.Join(", ", _cfg.UfsBuscaGeral)} | " +
+                  $"Fontes/Plataformas: {string.Join(" e ", _cfg.PlataformasBuscaGeral.Values)}");
 
         List<LicitacaoPncp> encontradas;
         try
         {
-            encontradas = await api.ListarBuscaGeralAsync(Configuracao.UfsBuscaGeral,
-                Configuracao.PlataformasBuscaGeral.Keys.ToList(), _cancelamento);
+            encontradas = await api.ListarBuscaGeralAsync(_cfg.UfsBuscaGeral,
+                _cfg.PlataformasBuscaGeral.Keys.ToList(), _cancelamento);
         }
         catch (OperationCanceledException) when (_cancelamento.IsCancellationRequested)
         {
@@ -520,6 +521,13 @@ public sealed class ExecutadorFluxo
             return 0;
         }
 
+        if (string.IsNullOrWhiteSpace(_cfg.EmailDestino) || string.IsNullOrWhiteSpace(_cfg.EmailRemetente))
+        {
+            Log.Erro("Destinatário ou remetente de e-mail não configurado (Email.Destino/Email.Remetente no " +
+                     "arquivo de configuração): e-mails NÃO enviados (ficam pendentes).");
+            return 1;
+        }
+
         if (string.IsNullOrWhiteSpace(_cfg.SmtpSenha))
         {
             Log.Erro("Variável de ambiente COMPRASGOV_SMTP_SENHA não definida: " +
@@ -527,7 +535,7 @@ public sealed class ExecutadorFluxo
             return 1;
         }
 
-        long limite = Configuracao.LimiteAnexosEmailMb * 1024L * 1024L;
+        long limite = _cfg.LimiteAnexosEmailMb * 1024L * 1024L;
 
         // Licitação que sozinha passa do limite vai SEM anexo (o corpo aponta os arquivos
         // na pasta de saída): com anexo o servidor recusaria a mensagem a cada ciclo.
@@ -536,7 +544,7 @@ public sealed class ExecutadorFluxo
             StringComparer.OrdinalIgnoreCase);
         foreach (ItemEmail item in itens.Where(i => semAnexo.Contains(i.Chave)))
             Log.Aviso($"{item.Numero}: {TamanhoArquivos(item) / 1024.0 / 1024.0:F1} MB em arquivos, acima do limite de " +
-                      $"{Configuracao.LimiteAnexosEmailMb} MB por e-mail; vai sem anexo.");
+                      $"{_cfg.LimiteAnexosEmailMb} MB por e-mail; vai sem anexo.");
 
         // Lotes de 2 a 4 licitações; um lote que passar do limite é dividido em mensagens menores.
         var lotes = EmailService.SepararEmLotes(itens)

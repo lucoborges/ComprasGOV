@@ -19,6 +19,10 @@ publish/
 # Guarda caminhos internos de rede (planilha e pasta de saida) e as notas
 # de especificacao originais, que contem informacoes do ambiente interno.
 **/Properties/launchSettings.json
+# Configuracao real (e-mails e caminhos internos). Versionar so deploy/appsettings.exemplo.json.
+appsettings.json
+appsettings.*.json
+!deploy/appsettings.exemplo.json
 HTML.md
 HTML.txt
 

@@ -17,13 +17,14 @@ public sealed class ComparadorFontes
     private readonly Configuracao _cfg;
     private readonly HistoricoService _historico;
     private readonly PncpApiService _api;
-    private readonly ComprasNetAutomacao _compras = new();
+    private readonly ComprasNetAutomacao _compras;
 
     public ComparadorFontes(Configuracao cfg, HistoricoService historico, PncpApiService api)
     {
         _cfg = cfg;
         _historico = historico;
         _api = api;
+        _compras = new ComprasNetAutomacao(cfg.UrlPesquisa);
     }
 
     private sealed record ResultadoUasg(
