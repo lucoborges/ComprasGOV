@@ -210,7 +210,27 @@ Copy-Item (Join-Path $Origem 'deploy\saude.cmd') (Join-Path $Raiz 'saude.cmd') -
 Copy-Item (Join-Path $Origem 'deploy\appsettings.exemplo.json') `
     (Join-Path (Split-Path $ArquivoConfig -Parent) 'appsettings.exemplo.json') -Force
 
-if (-not (Get-ScheduledTask -TaskName $NomeTarefa -ErrorAction SilentlyContinue)) {
+$existente = Get-ScheduledTask -TaskName $NomeTarefa -ErrorAction SilentlyContinue
+if ($existente) {
+    # Tarefa ja existe: garante sem limite de execucao (no PowerShell 4 o -ExecutionTimeLimit
+    # zero vira PT72H e o Windows encerraria o robo em 3 dias) e a espera de 2 min no boot
+    # (S4U com espera zero nao sobe no reinicio). O robo esta parado neste ponto.
+    $mudou = $false
+    if ($existente.Settings.ExecutionTimeLimit -ne 'PT0S') {
+        Write-Host "   Tarefa: limite de execucao $($existente.Settings.ExecutionTimeLimit) -> sem limite."
+        $existente.Settings.ExecutionTimeLimit = 'PT0S'
+        $mudou = $true
+    }
+    foreach ($g in @($existente.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })) {
+        if ($g.Delay -ne 'PT2M') {
+            Write-Host "   Tarefa: espera no boot '$($g.Delay)' -> PT2M."
+            $g.Delay = 'PT2M'
+            $mudou = $true
+        }
+    }
+    if ($mudou) { $existente | Set-ScheduledTask | Out-Null }
+}
+else {
     Write-Host "   Criando a tarefa agendada '$NomeTarefa'..."
     # S4U: sobe no boot sem sessao aberta e sem senha gravada; enxerga as variaveis
     # COMPRASGOV_* do usuario e as pastas de rede do proprio servidor.
@@ -224,6 +244,12 @@ if (-not (Get-ScheduledTask -TaskName $NomeTarefa -ErrorAction SilentlyContinue)
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName $NomeTarefa -Action $acao -Trigger $gatilho -Principal $conta `
         -Settings $opcoes -Description 'Robo ComprasGOV (PNCP) - sobe no boot, sem sessao aberta' | Out-Null
+    # PowerShell 4: o limite zero acima e gravado como PT72H; corrige depois de registrar
+    $criada = Get-ScheduledTask -TaskName $NomeTarefa
+    if ($criada.Settings.ExecutionTimeLimit -ne 'PT0S') {
+        $criada.Settings.ExecutionTimeLimit = 'PT0S'
+        $criada | Set-ScheduledTask | Out-Null
+    }
 }
 
 Write-Host '4. Iniciando e conferindo...'
