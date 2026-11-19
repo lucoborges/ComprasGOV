@@ -228,7 +228,15 @@ if ($existente) {
             $mudou = $true
         }
     }
-    if ($mudou) { $existente | Set-ScheduledTask | Out-Null }
+    if ($mudou) {
+        # O runner roda como SYSTEM, que nao pode alterar uma tarefa S4U do Administrator.
+        # Isso nunca pode derrubar o deploy (o robo esta parado aqui): so avisa.
+        try { $existente | Set-ScheduledTask -ErrorAction Stop | Out-Null }
+        catch {
+            Write-Host ('   AVISO: nao foi possivel ajustar a tarefa (' + $_.Exception.Message.Trim() +
+                '). Ajuste como Administrator no servidor.') -ForegroundColor Yellow
+        }
+    }
 }
 else {
     Write-Host "   Criando a tarefa agendada '$NomeTarefa'..."
@@ -248,7 +256,8 @@ else {
     $criada = Get-ScheduledTask -TaskName $NomeTarefa
     if ($criada.Settings.ExecutionTimeLimit -ne 'PT0S') {
         $criada.Settings.ExecutionTimeLimit = 'PT0S'
-        $criada | Set-ScheduledTask | Out-Null
+        try { $criada | Set-ScheduledTask -ErrorAction Stop | Out-Null }
+        catch { Write-Host '   AVISO: a tarefa ficou com limite PT72H; ajuste como Administrator no servidor.' -ForegroundColor Yellow }
     }
 }
 
